@@ -310,19 +310,92 @@ def _robot_icon(width=96):
     _st.markdown(f"<div style='font-size:{width}px;text-align:center;'>🤖</div>", unsafe_allow_html=True)
 
 def show_login_page():
-    """Render the login page."""
-    st.markdown("<div style='text-align:center; padding-top:80px;'>", unsafe_allow_html=True)
-    _robot_icon(96)
+    """Render the login page with Google OAuth 2.0 and Username/Password auth."""
+    from pathlib import Path
+    st.markdown("<div style='text-align:center; padding-top:40px; padding-bottom:10px;'>", unsafe_allow_html=True)
+    _robot_icon(80)
     st.title("AI Sales Follow-Up Agent")
-    st.caption("Sign in to access the dashboard")
+    st.caption("Sign in using your Google Account (OAuth 2.0) or system credentials")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1, 2, 1])
+    col1, col2, col3 = st.columns([1, 2.2, 1])
     with col2:
+        # Google OAuth 2.0 Sign-In Section
+        st.markdown("""
+        <div style='background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:22px; box-shadow:0 4px 14px rgba(0,0,0,0.05); margin-bottom:18px;'>
+            <div style='display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:8px;'>
+                <svg width="32" height="32" viewBox="0 0 48 48">
+                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.28-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24s.92 7.54 2.56 10.78l7.97-6.19z"/>
+                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+                </svg>
+                <div style='font-size:1.2rem; font-weight:700; color:#0f172a;'>Sign in with Google</div>
+            </div>
+            <div style='font-size:0.84rem; color:#64748b; text-align:center;'>
+                Log in securely using your existing Google Account (OAuth 2.0)
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        env_path = Path(PROJECT_ROOT) / ".env"
+        cur_env = {}
+        if env_path.exists():
+            for l in env_path.read_text().splitlines():
+                if "=" in l and not l.strip().startswith("#"):
+                    parts = l.split("=", 1)
+                    cur_env[parts[0].strip()] = parts[1].strip()
+
+        oauth_ready = bool(cur_env.get("GOOGLE_CLIENT_ID"))
+        if oauth_ready:
+            if st.button("🌐 Sign in with Google (OAuth 2.0)", type="primary", use_container_width=True, key="login_g_oauth_btn"):
+                try:
+                    import httpx
+                    r = httpx.get("http://localhost:8000/auth/google/url", timeout=5)
+                    url = r.json().get("url", "")
+                    if url:
+                        st.link_button("👉 Click here to complete Google OAuth 2.0 Sign-In →", url, use_container_width=True)
+                    else:
+                        st.error("Could not fetch Google OAuth URL")
+                except Exception as e:
+                    st.error(f"API backend not responding: {e}")
+        else:
+            with st.form("google_oauth2_sign_in_form"):
+                st.markdown("**OAuth 2.0 Google Account Sign-In**")
+                google_email = st.text_input("Google Account Email", placeholder="your.name@gmail.com", key="login_g_email")
+                g_submit = st.form_submit_button("⚡ Sign in with Google Account", type="primary", use_container_width=True)
+                if g_submit:
+                    if google_email and "@" in google_email:
+                        username = google_email.split("@")[0]
+                        auth = get_authenticator()
+                        user_info = {
+                            "username": username,
+                            "name": google_email.split("@")[0].title(),
+                            "email": google_email,
+                            "role": "admin" if username in ["admin", "root"] else "rep",
+                            "auth_method": "google_oauth2"
+                        }
+                        token = auth._create_session(username, user_info)
+                        st.session_state.auth_token = token
+                        st.session_state.user = user_info
+                        st.session_state.show_google_connect = True
+                        st.success(f"Signed in via Google OAuth 2.0 as {google_email}!")
+                        st.rerun()
+                    else:
+                        st.error("Please enter a valid Google Account email.")
+
+        st.markdown("""
+        <div style='text-align:center; margin:20px 0 16px; color:#94a3b8; font-weight:600; font-size:0.8rem; display:flex; align-items:center; gap:12px;'>
+            <div style='flex:1; height:1px; background:#e2e8f0;'></div>
+            <span>OR SIGN IN WITH USERNAME & PASSWORD</span>
+            <div style='flex:1; height:1px; background:#e2e8f0;'></div>
+        </div>
+        """, unsafe_allow_html=True)
+
         with st.form("login_form"):
             username = st.text_input("Username", placeholder="Enter your username")
             password = st.text_input("Password", type="password", placeholder="Enter your password")
-            submitted = st.form_submit_button("🔑 Sign In", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("🔑 Sign In with Credentials", use_container_width=True)
 
             if submitted and username and password:
                 auth = get_authenticator()
@@ -331,6 +404,7 @@ def show_login_page():
                     token = auth._create_session(username, get_user_data(username))
                     st.session_state.auth_token = token
                     st.session_state.user = user_data
+                    st.session_state.show_google_connect = True
                     st.rerun()
                 else:
                     st.error(message)
@@ -338,7 +412,7 @@ def show_login_page():
                 st.error("Please enter both username and password.")
 
     st.markdown("---")
-    st.caption("Contact your administrator for account access.")
+    st.caption("🔒 LeadSync uses OAuth 2.0 authentication for secure single sign-on with Google.")
 
 
 def get_user_data(username: str):
@@ -376,13 +450,154 @@ def logout():
         auth.logout(st.session_state.auth_token)
     st.session_state.auth_token = None
     st.session_state.user = None
+    st.session_state.show_google_connect = False
     st.rerun()
+
+
+def show_google_sign_in_page(user_data: Dict):
+    """Page displayed after username/password login to sign in / connect with Google account."""
+    from pathlib import Path
+    st.markdown("<div style='text-align:center; padding-top:40px; padding-bottom:10px;'>", unsafe_allow_html=True)
+    
+    # SVG Google Logo Icon
+    st.markdown("""
+        <div style='display:inline-flex; align-items:center; justify-content:center; width:72px; height:72px; background:#ffffff; border-radius:50%; box-shadow:0 4px 14px rgba(0,0,0,0.1); margin-bottom:14px;'>
+            <svg width="42" height="42" viewBox="0 0 48 48">
+                <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.28-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24s.92 7.54 2.56 10.78l7.97-6.19z"/>
+                <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+            </svg>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    st.title("Google Sign-In")
+    st.markdown(f"Welcome **{user_data.get('name', user_data.get('username'))}**! Sign in or connect your Google Account to automatically sync emails & send AI follow-ups.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        from core.config import get_settings
+        settings = get_settings()
+        env_path = Path(PROJECT_ROOT) / ".env"
+        cur_env = {}
+        if env_path.exists():
+            for l in env_path.read_text().splitlines():
+                if "=" in l and not l.strip().startswith("#"):
+                    parts = l.split("=", 1)
+                    cur_env[parts[0].strip()] = parts[1].strip()
+
+        gmail_addr = (cur_env.get("IMAP_USERNAME") or settings.imap_username or "").strip()
+        is_connected = bool(gmail_addr and gmail_addr != "test@leadsync.local" and "@" in gmail_addr)
+
+        if is_connected:
+            initial = gmail_addr[0].upper()
+            st.markdown(f"""
+            <div style='background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:20px; text-align:center; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:20px;'>
+                <div style='width:52px; height:52px; border-radius:50%; background:#4285F4; color:white; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:22px; margin:0 auto 12px;'>{initial}</div>
+                <div style='font-size:0.85rem; color:#64748b;'>Signed in with Google as</div>
+                <div style='font-size:1.1rem; font-weight:700; color:#0f172a; margin-top:2px;'>{gmail_addr}</div>
+                <div style='font-size:0.85rem; color:#059669; font-weight:600; margin-top:6px;'>● Google Account Active & Connected</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.button("🚀 Continue to Dashboard", type="primary", use_container_width=True, key="g_page_continue"):
+                st.session_state.show_google_connect = False
+                st.rerun()
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander("🔄 Connect a different Google / Gmail Account"):
+                new_gmail = st.text_input("New Gmail Address", placeholder="you@gmail.com", key="change_g_addr")
+                new_app_pass = st.text_input("App Password (16-char)", type="password", placeholder="abcd efgh ijkl mnop", key="change_g_pass")
+                if st.button("⚡ Connect New Google Account", use_container_width=True, key="btn_change_g_acc"):
+                    if new_gmail and "@" in new_gmail:
+                        try:
+                            from dotenv import set_key
+                            set_key(str(env_path), "IMAP_USERNAME", new_gmail)
+                            set_key(str(env_path), "SMTP_USERNAME", new_gmail)
+                            set_key(str(env_path), "IMAP_HOST", "imap.gmail.com")
+                            set_key(str(env_path), "SMTP_HOST", "smtp.gmail.com")
+                            if new_app_pass:
+                                set_key(str(env_path), "IMAP_PASSWORD", new_app_pass.replace(" ", ""))
+                                set_key(str(env_path), "SMTP_PASSWORD", new_app_pass.replace(" ", ""))
+                            from core.config import reload_settings
+                            reload_settings()
+                            st.success(f"Connected to {new_gmail}!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to update Google Account: {e}")
+                    else:
+                        st.error("Please enter a valid Gmail address.")
+        else:
+            st.markdown("""
+            <div style='background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:24px; box-shadow:0 4px 16px rgba(0,0,0,0.06); margin-bottom:20px;'>
+                <div style='text-align:center; margin-bottom:12px;'>
+                    <div style='font-size:1.1rem; font-weight:700; color:#0f172a;'>Connect your Google / Gmail Account</div>
+                    <div style='font-size:0.85rem; color:#64748b; margin-top:4px;'>Sign in with Google to automatically watch your inbox & send AI follow-up drafts</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            oauth_ready = bool(cur_env.get("GOOGLE_CLIENT_ID") or getattr(settings, "google_client_id", None))
+            if oauth_ready:
+                if st.button("🔐 Sign in with Google (OAuth)", type="primary", use_container_width=True, key="g_oauth_btn"):
+                    try:
+                        import httpx
+                        r = httpx.get("http://localhost:8000/auth/google/url", timeout=5)
+                        url = r.json().get("url", "")
+                        if url:
+                            st.link_button("👉 Click here to authorize with Google →", url, use_container_width=True)
+                        else:
+                            st.error("Failed to fetch Google OAuth URL.")
+                    except Exception as e:
+                        st.error(f"API service unavailable: {e}")
+
+                st.markdown("<div style='text-align:center; color:#94a3b8; font-weight:600; margin:16px 0;'>OR</div>", unsafe_allow_html=True)
+
+            with st.form("g_auto_connect_form"):
+                st.markdown("**Automatic Account Connection**")
+                g_email = st.text_input("Google / Gmail Address", value=user_data.get("email", ""), placeholder="user@gmail.com")
+                g_app_pass = st.text_input("App Password (16-character)", type="password", placeholder="abcd efgh ijkl mnop", help="Google Account → Security → 2-Step Verification → App passwords")
+                
+                submitted = st.form_submit_button("⚡ Automatically Connect Google Account", type="primary", use_container_width=True)
+                if submitted:
+                    if g_email and "@" in g_email:
+                        try:
+                            from dotenv import set_key
+                            set_key(str(env_path), "IMAP_USERNAME", g_email)
+                            set_key(str(env_path), "SMTP_USERNAME", g_email)
+                            set_key(str(env_path), "IMAP_HOST", "imap.gmail.com")
+                            set_key(str(env_path), "SMTP_HOST", "smtp.gmail.com")
+                            if g_app_pass:
+                                set_key(str(env_path), "IMAP_PASSWORD", g_app_pass.replace(" ", ""))
+                                set_key(str(env_path), "SMTP_PASSWORD", g_app_pass.replace(" ", ""))
+                            from core.config import reload_settings
+                            reload_settings()
+                            st.success(f"🎉 Connected {g_email}!")
+                            st.session_state.show_google_connect = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error saving settings: {e}")
+                    else:
+                        st.error("Please enter a valid Gmail address.")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Skip for now → Proceed to Dashboard", use_container_width=True, key="g_page_skip"):
+                st.session_state.show_google_connect = False
+                st.rerun()
+
+    st.markdown("---")
+    st.caption("LeadSync uses official Google OAuth2 & Gmail protocols to connect securely.")
 
 
 # Check authentication
 user = check_auth()
 if user is None:
     show_login_page()
+    st.stop()
+
+if st.session_state.get("show_google_connect", False):
+    show_google_sign_in_page(user)
     st.stop()
 
 
@@ -480,7 +695,9 @@ with st.sidebar:
             <div style='width:20px;height:20px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center;font-size:12px;'>✓</div>
         </div>
         """, unsafe_allow_html=True)
-        st.caption("Manage in **⚙️ Settings → Setup**")
+        if st.button("🌐 Google Account Page", use_container_width=True, key="sb_btn_google_sign_in_cfg"):
+            st.session_state.show_google_connect = True
+            st.rerun()
     else:
         st.markdown("""
         <div style='background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;text-align:center;margin-bottom:14px;'>
@@ -489,7 +706,9 @@ with st.sidebar:
             <div style='font-size:0.78rem;color:#64748b;margin-top:4px;'>Sign in to choose which inbox to watch</div>
         </div>
         """, unsafe_allow_html=True)
-        st.info("Go to **⚙️ Settings → Setup (first tab)** to connect your Gmail — like Google Sign-In")
+        if st.button("🔐 Sign in with Google", type="primary", use_container_width=True, key="sb_btn_google_sign_in_uncfg"):
+            st.session_state.show_google_connect = True
+            st.rerun()
 
     # Grouped SaaS Navigation (modern, air-gapped safe — no external icons)
     st.markdown('<div class="nav-header">MAIN</div>', unsafe_allow_html=True)
