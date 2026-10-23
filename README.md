@@ -86,7 +86,7 @@ Every component uses production-grade code:
 | Priority Scoring | Weighted formula: urgency (40%), deal value (30%), engagement (20%), recency (10%) |
 | Action Engine | Determines close / re-engage / nurture / escalate based on score + context |
 | Draft Generation | 3 tone variants (agreeable, direct, soft) via LLM with deterministic fallback |
-| Email Tracking | Open/click pixel generation with engagement scoring |
+| Email Tracking | Open/click pixels that **record real events** (memory + audit trail + DB counters) with engagement scoring |
 | Suppression List | File-based GDPR/CCPA compliance |
 
 ### Multi-Channel Alerting (7 Channels)
@@ -111,6 +111,42 @@ When SLA breaches occur, LeadSync notifies through every configured channel simu
 - Mandatory 2FA enforcement for admin accounts
 - Role-based access control (admin, rep, viewer)
 
+### API Authentication (fail-closed by default)
+
+Every mutating/admin endpoint requires an API key or bearer session token unless you explicitly disable auth for local development:
+
+| Variable | Default | Behavior |
+|----------|---------|----------|
+| `AUTH_REQUIRED` | `true` | Enforce API-key auth on protected endpoints |
+| `API_KEYS` | *(empty)* | Comma-separated raw keys (hashed internally, compared in constant time) |
+| `ADMIN_PASSWORD` | *(random)* | Bootstrap admin password; if unset a random one is generated and written to a `0600` bootstrap file — never logged |
+
+```bash
+# Create a key instead of using env vars
+python -m core.auth create-key my-integration --role admin
+
+# Call the API
+curl -H "X-API-Key: <key>" http://localhost:8000/queue/stats -X POST
+# ... or with a session token from POST /auth/login
+curl -H "Authorization: Bearer <token>" ...
+```
+
+**Fail-closed behavior:** with `AUTH_REQUIRED=true` and no keys configured, protected endpoints return `503 api_auth_not_configured` with remediation instructions — LeadSync never silently runs unauthenticated. Session tokens are issued by `POST /auth/login` (username/password + TOTP when 2FA is enabled) and invalidated by `POST /auth/logout`.
+
+Public endpoints: `/health`, `/metrics`, `/docs`, tracking pixel/click callbacks (called by email clients), OAuth callback, and one-time recovery redemption.
+
+**Other security defaults:**
+
+- **Recovery links are never returned in HTTP responses** — they are emailed to the registered address only. (Dev-only escape hatch: `RETURNS_LINK_IN_RESPONSE=true`.)
+- Per-user throttling on 2FA verification, login, and recovery-link requests.
+- Rate-limit identity only honors `X-Forwarded-For` from proxies listed in `TRUSTED_PROXIES` (comma-separated IPs) — the header can't be spoofed to defeat the limiter.
+- Google OAuth uses single-use `state` tokens (CSRF); the Gmail token file is written `0600`.
+- Backup endpoints confine paths to the project tree (no `.env` reads via `/backup/verify`) and never copy `auth_config.yaml` via HTTP-triggered backups.
+- Caller-supplied IMAP hosts are refused when they resolve to private IPs (SSRF guard; override with `ALLOW_PRIVATE_IMAP=true` for self-hosted mail).
+- CORS is an explicit allowlist (`ALLOWED_ORIGINS`), defaulting to the local Streamlit UI.
+- CSV/PDF exports neutralize spreadsheet formula injection and unsupported unicode.
+- `/ingest/call` accepts multipart audio uploads (50 MB limit, extension allowlist, virus-safe temp-dir cleanup) instead of taking arbitrary server paths.
+
 ### Webhook Payload Inspector
 
 Debug exactly what gets sent to each service:
@@ -132,9 +168,11 @@ WebSocket-based live updates when queue changes:
 
 ### Database Persistence
 
-- PostgreSQL with Alembic migrations
-- Conversation history and audit trail
-- Automated backup and restore
+- SQLite out of the box; PostgreSQL/SQLite both work via `DATABASE_URL`
+- Alembic migrations (`alembic upgrade head` or `python scripts/migrate.py`)
+- Every ingested conversation, scored prospect, and draft is persisted automatically (best-effort — the pipeline never breaks on DB errors)
+- Conversation history and immutable audit trail
+- Automated backup, verify, restore and rotation (with path confinement over HTTP)
 - CSV/PDF export for compliance
 
 ### Compliance
@@ -244,15 +282,18 @@ docker compose down
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check + LLM status |
+| `GET` | `/health` | Health check + LLM status *(public)* |
 | `POST` | `/pipeline/process` | **Full autonomous pipeline** |
 | `POST` | `/ingest/emails` | Fetch emails from IMAP |
 | `POST` | `/ingest/email` | Parse single email |
-| `POST` | `/ingest/call` | Transcribe call recording |
+| `POST` | `/ingest/call` | Transcribe call recording (multipart upload or on-disk path) |
 | `POST` | `/ingest/meeting` | Parse meeting notes |
 | `POST` | `/score` | Score a conversation |
 | `POST` | `/action/determine` | Get next best action |
 | `POST` | `/drafts/generate` | Generate 3 tone variants |
+| `GET` | `/tracking/pixel/{id}` | Open-tracking pixel (records the event) *(public)* |
+| `POST` | `/tracking/click` | Click tracking (records the event, updates the queue) |
+| `GET` | `/tracking/engagement/{id}` | Open/click stats + engagement score |
 
 ### Queue Management
 
@@ -275,14 +316,19 @@ docker compose down
 
 ### Security
 
+All endpoints in the Reference (except the ones marked *public*) require `X-API-Key` or a bearer token (see [API Authentication](#api-authentication-fail-closed-by-default)).
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/auth/login` | Authenticate user |
+| `POST` | `/auth/login` | Authenticate user → bearer session token |
+| `POST` | `/auth/logout` | Invalidate a session token |
 | `POST` | `/auth/2fa/enable` | Enable 2FA |
-| `POST` | `/auth/2fa/verify` | Verify TOTP code |
-| `POST` | `/auth/2fa/recovery/request` | Request recovery link |
+| `POST` | `/auth/2fa/verify` | Verify TOTP code (throttled per user) |
+| `POST` | `/auth/2fa/recovery/request` | Request recovery link — **emailed only, never in the response** |
 
-### Export & Compliance
+### Export, Backup & Compliance
+
+> Backup endpoints confine paths to the project tree and exclude `auth_config.yaml` (secrets) from HTTP-triggered backups. CLI runs (`python scripts/db_backup.py ...`) keep full flexibility for external destinations.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -318,12 +364,19 @@ SLA_LOW_HOURS=72
 USE_REDIS=true
 REDIS_URL=redis://localhost:6379
 
-# Database (optional)
-DATABASE_URL=postgresql://user:pass@localhost:5432/leadsync
+# Database — SQLite by default (out of the box), Postgres for production
+DATABASE_URL=sqlite:///./data/leadsync.db
+# DATABASE_URL=postgresql://user:pass@localhost:5432/leadsync
 
 # Security
+AUTH_REQUIRED=true
+API_KEYS=key-for-scripts-1,key-for-ci-2        # empty + AUTH_REQUIRED=true → protected endpoints return 503
+ADMIN_PASSWORD=                                # random one-time bootstrap password if empty
 ENFORCE_2FA_ADMIN=true
 RECOVERY_LINK_TTL_HOURS=1
+TRUSTED_PROXIES=                               # list your reverse-proxy IPs only, e.g. 10.0.0.5,10.0.0.6
+ALLOWED_ORIGINS=                               # CORS allowlist; default: local Streamlit UI
+API_BASE_URL=http://localhost:8000             # used by the Streamlit UI
 
 # Alerting
 TELEGRAM_BOT_TOKEN=your-bot-token

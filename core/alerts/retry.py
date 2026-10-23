@@ -58,19 +58,27 @@ class RetryAttempt:
 class RetryResult:
     """Result of a retryable operation."""
     success: bool
-    attempts: List[RetryAttempt]
-    total_time_ms: float
+    attempts: int
+    total_delay: float = 0.0
+    error: Optional[str] = None
     final_response: Optional[Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialization for API/audit consumption."""
+        return {
+            "success": self.success,
+            "attempts": self.attempts,
+            "total_delay_seconds": self.total_delay,
+            "error": self.error,
+        }
 
     @property
     def attempt_count(self) -> int:
-        return len(self.attempts)
+        return self.attempts
 
     @property
     def last_error(self) -> Optional[str]:
-        if self.attempts and not self.success:
-            return self.attempts[-1].error
-        return None
+        return self.error if not self.success else None
 
 
 def _calculate_delay(attempt: int, config: RetryConfig) -> float:
