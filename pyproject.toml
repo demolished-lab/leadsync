@@ -29,6 +29,15 @@ dependencies = [
     "bcrypt>=4.0.0",
     "qrcode[pil]>=7.4.0",
     "segno>=1.5.0",
+    # Hard-required by core (verified by grep): core/database imports sqlalchemy
+    # unconditionally; core/monitoring uses prometheus_client; api/app.py uses
+    # UploadFile/File (needs python-multipart); Redis is the out-of-box queue
+    # backend (code guards the import, but USE_REDIS=true must work as shipped).
+    "sqlalchemy>=2.0.0",
+    "prometheus-client>=0.19",
+    "python-multipart>=0.0.9",
+    "redis>=5.0.0",
+    # Gmail API ingestion (core/ingest/gmail_api.py uses googleapiclient/google.auth)
     "google-auth>=2.20.0",
     "google-auth-oauthlib>=1.1.0",
     "google-api-python-client>=2.100.0",
@@ -39,6 +48,7 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
+    "alembic>=1.13.0",
 ]
 email = [
     "imapclient>=2.3.0",
@@ -66,11 +76,13 @@ monitoring = [
     "prometheus-fastapi-instrumentator>=5.0.0",
 ]
 all = [
-    "sales-followup-agent[dev,email,llm,stt,database,redis,ui,monitoring]",
+    "leadsync[dev,email,llm,stt,database,redis,ui,monitoring]",
 ]
 
 [project.scripts]
-sales-followup = "api.app:app"
+# Points at api.app:main (context-managed uvicorn.run wrapper added for this
+# purpose; api.app:app was invalid — it's a FastAPI instance, not callable).
+sales-followup = "api.app:main"
 
 [tool.setuptools.packages.find]
 include = ["core*", "api*"]

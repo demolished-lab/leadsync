@@ -18,11 +18,14 @@ COPY pyproject.toml README.md ./
 COPY core/ core/
 COPY api/ api/
 
-# Install into a virtual env for clean copying
+# Install into a virtual env for clean copying.
+# Extras: database (sqlalchemy/psycopg2), redis, monitoring, email are the
+# minimal set the container actually runs with. llm/stt stay optional —
+# the stt extra pulls openai-whisper, which is a multi-GB download.
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir .
+    && pip install --no-cache-dir ".[database,redis,monitoring,email]"
 
 # ── Stage 2: Runtime image ────────────────────────────────────
 FROM python:3.12-slim AS runtime
@@ -49,8 +52,10 @@ COPY pyproject.toml ./
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Create non-root user
+# Create non-root user; /app and data dirs owned by it (volumes such as
+# suppressions:/app/data/suppressions need a writable, app-owned parent)
 RUN groupadd -r app && useradd -r -g app -d /app -s /bin/bash app \
+    && mkdir -p /app/data/suppressions \
     && chown -R app:app /app
 USER app
 

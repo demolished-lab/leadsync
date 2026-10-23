@@ -36,11 +36,13 @@ desktop.ini
 .env.*.local
 auth_config.yaml
 auth_config.json
+auth_config_bootstrap_password.txt
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # Backups
 backups/
@@ -71,11 +73,12 @@ docker-compose.override.yml
 # Node (for tooling)
 node_modules/
 
-# Models (large files)
-models/
+# Model weights & ML artifacts (large files)
+# NOTE: this must NOT match core/models/ (pydantic domain models)
 *.bin
 *.gguf
 *.onnx
+whisper_models/
 
 # Audit logs
 *.jsonl

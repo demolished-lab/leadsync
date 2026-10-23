@@ -10,11 +10,38 @@ Provides:
 
 import time
 import threading
+import hmac
+import os
+import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from fastapi import HTTPException, Query, WebSocket, WebSocketDisconnect
+
+
+def resolve_client_ip(request) -> str:
+    """
+    Resolve the real client IP for a request.
+
+    A client-supplied X-Forwarded-For header is honored ONLY when the
+    direct peer (request.client.host) is listed in the TRUSTED_PROXIES
+    env var (comma-separated IPs). Otherwise the direct peer is used,
+    which makes rate-limit identity unspoofable.
+    """
+    trusted_proxies = {
+        p.strip() for p in (os.environ.get("TRUSTED_PROXIES", "") or "").split(",") if p.strip()
+    }
+    client_host = request.client.host if request.client else "unknown"
+
+    if trusted_proxies:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded and client_host in trusted_proxies:
+            candidate = forwarded.split(",")[0].strip()
+            # Validate the claimed IP before trusting it
+            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", candidate) or ":" in candidate:
+                return candidate
+    return client_host
 
 
 # ── Sliding Window Rate Limiter ────────────────────────────────
@@ -168,18 +195,7 @@ class RateLimitMiddleware:
 
     def _get_client_ip(self, request) -> str:
         """Extract client IP — only trust X-Forwarded-For if from trusted proxy."""
-        import os as _os
-        trusted_proxies = {p.strip() for p in _os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()}
-        client_host = request.client.host if request.client else "unknown"
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded and (not trusted_proxies or client_host in trusted_proxies):
-            # take first forwarded IP but validate it looks like IP
-            candidate = forwarded.split(",")[0].strip()
-            # basic IP validation — fallback to client_host if spoofed
-            import re as _re
-            if _re.match(r"^\d{1,3}(\.\d{1,3}){3}$", candidate) or ":" in candidate:
-                return candidate
-        return client_host
+        return resolve_client_ip(request)
 
     def check(self, path: str, client_ip: str) -> Tuple[bool, Dict[str, Any]]:
         """Check if a request is allowed."""
@@ -292,24 +308,36 @@ class APIKeyVerifier:
     def verify(self, api_key: str) -> Optional[Dict[str, Any]]:
         """
         Verify an API key. Returns key metadata or None if invalid.
+
+        Stored entries are keyed by sha256(key)[:16] with the full key kept
+        as a bcrypt/SHA hash in ``key_hash`` — so matching is done by hashing
+        the presented key, never by prefix comparison.
+        Also accepts raw keys passed via the API_KEYS env var (comma-separated).
         """
         if not api_key:
             return None
 
         keys = self._load_keys()
-        prefix = api_key[:12] + "..." if len(api_key) > 12 else api_key
+        for key_data in keys.values():
+            if not isinstance(key_data, dict):
+                continue
+            try:
+                from core.auth import verify_password
+                if verify_password(api_key, key_data.get("key_hash", "")):
+                    return {
+                        "name": key_data.get("name", "unknown"),
+                        "role": key_data.get("role", "rep"),
+                    }
+            except Exception:
+                pass
 
-        for stored_prefix, key_data in keys.items():
-            if stored_prefix == prefix:
-                try:
-                    from core.auth import verify_password
-                    if verify_password(api_key, key_data.get("key_hash", "")):
-                        return {
-                            "name": key_data.get("name", "unknown"),
-                            "role": key_data.get("role", "rep"),
-                        }
-                except Exception:
-                    pass
+        # Env-var fallback: API_KEYS="key1,key2" — compare in constant time
+        env_keys = (os.environ.get("API_KEYS") or "").split(",")
+        for candidate in env_keys:
+            candidate = candidate.strip()
+            if candidate and hmac.compare_digest(api_key, candidate):
+                return {"name": "env-key", "role": "rep"}
+
         return None
 
     def invalidate_cache(self) -> None:

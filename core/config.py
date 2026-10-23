@@ -65,8 +65,23 @@ try:
         prometheus_enabled: bool = True
         metrics_port: int = 9090
 
-        # Tracking base URL
-        tracking_base_url: str = "https://yourdomain.com/track"
+        # Tracking base URL (must be publicly reachable for tracking pixels)
+        tracking_base_url: str = "http://localhost:8000/track"
+
+        # Security
+        # Comma-separated raw API keys (hashed internally). Leave empty to
+        # disable API-key auth entirely (see auth_required).
+        api_keys: str = ""
+        # Comma-separated CORS allowlist. Empty → localhost UI origins only.
+        allowed_origins: str = ""
+        # When true, all mutating/admin API endpoints require a valid API key.
+        auth_required: bool = True
+        # Only honor X-Forwarded-For from these proxy IPs/CIDR-ish prefixes
+        trusted_proxies: str = ""
+        # Base URL of the FastAPI API as reachable from the Streamlit UI
+        api_base_url: str = "http://localhost:8000"
+        # Capture outbound webhook payloads in the inspector
+        inspector_enabled: bool = True
 
         # Gmail OAuth (like Macro — Sign in with Google)
         google_client_id: Optional[str] = None
@@ -80,9 +95,6 @@ try:
 
         # Database (optional)
         database_url: Optional[str] = None
-        # Queue
-        queue_max_items_per_rep: int = 50
-        trusted_proxies: str = ""
         # Air-gapped / offline mode — when true, no external network calls are made
         air_gapped: bool = False
 
@@ -150,7 +162,7 @@ except ImportError:
             self.prometheus_enabled: bool = os.environ.get("PROMETHEUS_ENABLED", "true").lower() == "true"
             self.metrics_port: int = int(os.environ.get("METRICS_PORT", "9090"))
 
-            self.tracking_base_url: str = os.environ.get("TRACKING_BASE_URL", "https://yourdomain.com/track")
+            self.tracking_base_url: str = os.environ.get("TRACKING_BASE_URL", "http://localhost:8000/track")
             self.google_client_id: Optional[str] = os.environ.get("GOOGLE_CLIENT_ID")
             self.google_client_secret: Optional[str] = os.environ.get("GOOGLE_CLIENT_SECRET")
             self.google_redirect_uri: str = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
@@ -158,6 +170,11 @@ except ImportError:
             self.use_redis: bool = os.environ.get("USE_REDIS", "false").lower() == "true"
             self.redis_url: str = os.environ.get("REDIS_URL", "redis://localhost:6379")
             self.database_url: Optional[str] = os.environ.get("DATABASE_URL")
+            self.api_keys: str = os.environ.get("API_KEYS", "")
+            self.allowed_origins: str = os.environ.get("ALLOWED_ORIGINS", "")
+            self.auth_required: bool = os.environ.get("AUTH_REQUIRED", "true").lower() == "true"
+            self.api_base_url: str = os.environ.get("API_BASE_URL", "http://localhost:8000")
+            self.inspector_enabled: bool = os.environ.get("INSPECTOR_ENABLED", "true").lower() == "true"
             self.enforce_2fa_admin: bool = os.environ.get("ENFORCE_2FA_ADMIN", "false").lower() == "true"
             self.enforce_2fa_rep: bool = os.environ.get("ENFORCE_2FA_REP", "false").lower() == "true"
             self.air_gapped: bool = os.environ.get("AIR_GAPPED", "false").lower() == "true"

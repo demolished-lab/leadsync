@@ -4,10 +4,11 @@ import hashlib
 import logging
 import os
 import sys
-from datetime import datetime
+import time as _time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Form, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -40,6 +41,11 @@ from core.intelligence.scorer import (
 from core.models.conversation import Conversation
 from core.models.prospect import ScoredProspect
 from core.queue import PriorityQueue, get_queue
+from core.database.persistence import (
+    persist_conversation,
+    persist_scored_prospect,
+    persist_followup_draft,
+)
 from core.monitoring import metrics, record_request, record_queue_depth, record_sla_breach
 from core.middleware import (
     RateLimiter,
@@ -62,6 +68,11 @@ http_rate_limiter = RateLimitMiddleware(
         "/drafts/generate": {"max_requests": 20, "window_seconds": 60},
         "/send/follow-up": {"max_requests": 15, "window_seconds": 60},
         "/sla/check": {"max_requests": 10, "window_seconds": 60},
+        # Auth brute-force protection
+        "/auth/2fa/verify": {"max_requests": 10, "window_seconds": 300},
+        "/auth/2fa/backup-code": {"max_requests": 10, "window_seconds": 300},
+        "/auth/login": {"max_requests": 10, "window_seconds": 300},
+        "/auth/2fa/recovery/redeem": {"max_requests": 5, "window_seconds": 300},
     },
 )
 ws_rate_limiter = WebSocketRateLimiter(max_messages=30, window_seconds=60)
@@ -73,10 +84,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ── CORS — explicit allowlist (never wildcard + credentials) ──
+_origins = [o.strip() for o in (settings.allowed_origins or "").split(",") if o.strip()]
+if not _origins:
+    # Default: the shipped Streamlit UI + common dev origins only.
+    _origins = [
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ]
+_wildcard = "*" in _origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"] if _wildcard else _origins,
+    allow_credentials=False if _wildcard else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -221,20 +241,11 @@ async def lifespan(app: FastAPI):
         get_gmail_poller().stop()
     except: pass
 
-# attach lifespan to app (FastAPI >=0.109 supports lifespan param; keep on_event for compat)
+# attach lifespan via the supported parameter (no on_event re-entry hazard)
 app.router.lifespan_context = lifespan
-# keep deprecated hooks for backward compat with older tests
-@app.on_event("startup")
-async def startup_event():
-    async with lifespan(app):
-        pass
-@app.on_event("shutdown")
-async def shutdown_event():
-    pass
 
 
 # ── Request metrics middleware ────────────────────────────────
-import time as _time
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
@@ -255,13 +266,114 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 app.add_middleware(MetricsMiddleware)
 
 
+# ── API Key Authentication Middleware ─────────────────────────
+# Paths that are always public (read-only system surface, email-client
+# tracking callbacks, one-time recovery redemption):
+_PUBLIC_PATHS = {
+    "/",
+    "/health",
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/rate-limit/status",
+    "/ws/stats",
+    "/events/queue",  # SSE — read-only realtime feed (viewer access)
+    "/tracking/click",  # called by end-user email clients
+}
+
+_API_AUTH_CONFIGURED: Optional[bool] = None
+
+
+def _api_keys_configured() -> bool:
+    """True if at least one API key is defined (env or auth config)."""
+    global _API_AUTH_CONFIGURED
+    if _API_AUTH_CONFIGURED is None:
+        if (settings.api_keys or "").strip():
+            _API_AUTH_CONFIGURED = True
+        else:
+            try:
+                keys = api_key_verifier._load_keys()
+                _API_AUTH_CONFIGURED = bool(keys)
+            except Exception:
+                _API_AUTH_CONFIGURED = False
+    return _API_AUTH_CONFIGURED
+
+
+class AuthHTTPMiddleware(BaseHTTPMiddleware):
+    """
+    Enforces API-key authentication when AUTH_REQUIRED=true.
+
+    - Invalid key → 401; no keys configured at all → 503 (fail-closed).
+    - OPTIONS preflight passes through for CORS.
+    - WebSocket endpoints also enforce this in their own handlers.
+    """
+
+    async def dispatch(self, request, call_handler):
+        if not settings.auth_required:
+            return await call_handler(request)
+
+        if request.method == "OPTIONS":
+            return await call_handler(request)
+
+        path = request.url.path
+        if path in _PUBLIC_PATHS or path.startswith(("/tracking/pixel/", "/auth/google/callback", "/auth/2fa/recovery/redeem")):
+            return await call_handler(request)
+
+        api_key = (
+            request.headers.get("x-api-key")
+            or request.query_params.get("api_key")
+        )
+        if not api_key:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header[7:].strip()
+                try:
+                    from core.auth import get_authenticator
+                    user = get_authenticator().verify_session(token)
+                    if user is not None:
+                        return await call_handler(request)
+                except Exception:
+                    pass
+
+        if not api_key:
+            if not _api_keys_configured():
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "api_auth_not_configured",
+                        "message": (
+                            "Authentication is required but no API keys are configured. "
+                            "Set API_KEYS=<raw-key-1>,<raw-key-2> (env/.env), or run "
+                            "`python -m core.auth create-key <name>`, or set AUTH_REQUIRED=false "
+                            "for local-only development."
+                        ),
+                    },
+                )
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "message": "Valid X-API-Key required"},
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+
+        metadata = api_key_verifier.verify(api_key)
+        if metadata is None:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "message": "Invalid API key"},
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        return await call_handler(request)
+
+
+app.add_middleware(AuthHTTPMiddleware)
+
+
 # ── Rate Limit Middleware ──────────────────────────────────────
+from core.middleware import resolve_client_ip
 class RateLimitHTTPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_handler):
-        client_ip = (
-            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            or (request.client.host if request.client else "unknown")
-        )
+        client_ip = resolve_client_ip(request)
         path = request.url.path
 
         allowed, info = http_rate_limiter.check(path, client_ip)
@@ -381,9 +493,21 @@ async def websocket_queue(
             })
             await websocket.close(code=4003, reason="Invalid API key")
             return
+    elif settings.auth_required:
+        # API authentication is enforced — reject anonymous connections.
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "error",
+            "data": {
+                "message": "API key required: pass ?api_key=xxx or set AUTH_REQUIRED=false",
+                "code": 4001,
+            },
+        })
+        await websocket.close(code=4001, reason="API key required")
+        return
     else:
         # No API key provided — accept but mark as unauthenticated
-        # (allows anonymous read-only access if configured)
+        # (allows anonymous read-only access when AUTH_REQUIRED=false)
         auth_metadata = {"name": "anonymous", "role": "viewer"}
         logger.debug("WebSocket connected without API key (anonymous)")
 
@@ -540,7 +664,50 @@ async def websocket_stats() -> Dict[str, Any]:
 
 @app.get("/config", tags=["system"])
 async def get_config() -> Dict[str, Any]:
-    config = settings.get_all_config() if hasattr(settings, "get_all_config") else {}
+    """
+    Redacted configuration view (non-secret settings only).
+
+    Secrets (passwords, API keys, TOTP secrets, OAuth tokens) are never
+    included — only booleans indicating whether a secret is set.
+    """
+    auth_configured = _api_keys_configured()
+    config: Dict[str, Any] = {
+        "llm_provider": settings.llm_provider,
+        "ollama_host": settings.ollama_host if settings.llm_provider == "ollama" else None,
+        "sla_hours": {
+            "high": settings.sla_high_urgency_hours,
+            "medium": settings.sla_medium_urgency_hours,
+            "low": settings.sla_low_urgency_hours,
+        },
+        "queue_max_items_per_rep": settings.queue_max_items_per_rep,
+        "priority_score_decay_days": settings.priority_score_decay_days,
+        "email": {
+            "imap_configured": bool(settings.imap_username),
+            "smtp_configured": bool(settings.smtp_username),
+            "tracking_enabled": settings.email_tracking_enabled,
+            "gmail_oauth_configured": bool(settings.google_client_id),
+        },
+        "compliance": {
+            "gdpr": settings.gdpr_compliance_enabled,
+            "ccpa": settings.ccpa_compliance_enabled,
+            "air_gapped": settings.air_gapped,
+        },
+        "realtime": {
+            "use_redis": settings.use_redis,
+        },
+        "database": {
+            "configured": bool(settings.database_url) or True,  # falls back to engine default
+        },
+        "security": {
+            "auth_required": settings.auth_required,
+            "api_key_configured": auth_configured,
+            "enforce_2fa_admin": settings.enforce_2fa_admin,
+            "enforce_2fa_rep": settings.enforce_2fa_rep,
+            "inspector_enabled": bool(getattr(settings, "inspector_enabled", True)),
+            "allowed_origins": settings.allowed_origins or "localhost defaults",
+        },
+        "secrets_redacted": True,
+    }
     return {"config": config, "provided_at": datetime.utcnow().isoformat()}
 
 
@@ -569,6 +736,54 @@ async def rate_limit_status() -> Dict[str, Any]:
 # ========== Ingestion ==========
 
 
+def _assert_public_imap_host(host: str) -> None:
+    """
+    Block SSRF: refuse caller-supplied IMAP hosts that resolve to private,
+    loopback, link-local or otherwise non-public IP space.
+    Bypass explicitly with ALLOW_PRIVATE_IMAP=true (self-hosted mail servers).
+    """
+    import ipaddress
+    import socket
+
+    if (os.environ.get("ALLOW_PRIVATE_IMAP", "") or "").lower() == "true":
+        return
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise HTTPException(status_code=400, detail=f"Cannot resolve IMAP host: {host}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Refusing non-public IMAP host {host} (resolved {ip}). "
+                       "Set ALLOW_PRIVATE_IMAP=true if you intentionally use a self-hosted server.",
+            )
+
+
+async def _ingest_and_queue(conversations: List[Any], limit_note: str = "") -> Dict[str, Any]:
+    """Score + persist + queue a batch of conversations (shared by ingest endpoints)."""
+    queue = get_queue()
+    queued = 0
+    for conv in conversations:
+        try:
+            scored = score_prospect(conversation=conv)
+            persist_conversation(conv)
+            persist_scored_prospect(scored)
+            queue.add(scored)
+            queued += 1
+        except Exception as e:
+            logger.warning(f"Failed to score conversation {conv.id}: {e}")
+    return {"queued": queued, "queue_size": queue.size()}
+
+
 @app.post("/ingest/emails", tags=["ingestion"])
 async def ingest_emails(
     imap_host: Optional[str] = None,
@@ -586,6 +801,8 @@ async def ingest_emails(
 
     if not user or not pwd:
         raise HTTPException(status_code=400, detail="IMAP username and password required")
+    if host:
+        _assert_public_imap_host(host)
 
     try:
         conversations = fetch_emails(
@@ -597,18 +814,11 @@ async def ingest_emails(
             since_days=since_days,
             limit=limit,
         )
-        queue = get_queue()
-        for conv in conversations:
-            try:
-                scored = score_prospect(conversation=conv)
-                queue.add(scored)
-            except Exception as e:
-                logger.warning(f"Failed to score conversation {conv.id}: {e}")
-
+        result = await _ingest_and_queue(conversations)
         return {
             "message": f"Fetched and queued {len(conversations)} conversations",
             "conversation_count": len(conversations),
-            "queue_size": queue.size(),
+            **result,
             "status": "completed",
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -641,6 +851,8 @@ async def ingest_single_email(email_data: Dict[str, Any]) -> Dict[str, Any]:
 
         conv = parse_email_to_conversation(email_data)
         scored = score_prospect(conversation=conv)
+        persist_conversation(conv)
+        persist_scored_prospect(scored)
         queue = get_queue()
         queue.add(scored)
         return {
@@ -654,37 +866,76 @@ async def ingest_single_email(email_data: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Email processing failed: {e}")
 
 
+_UPLOAD_ALLOWED_EXT = (".wav", ".mp3", ".m4a", ".ogg", ".oga", ".flac", ".webm", ".mp4")
+_UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
 @app.post("/ingest/call", tags=["ingestion"])
 async def ingest_call(
-    audio_path: str = Form(None),
+    audio_path: Optional[str] = Form(None),
     model_size: str = Form("base"),
     language: Optional[str] = Form(None),
     prospect_name: Optional[str] = Form(None),
     file: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    # Secure handling: if file upload provided use it, else validate audio_path to prevent traversal
+    """
+    Process a call recording into a Conversation.
+
+    Two ways to provide audio:
+    1. Upload the file as multipart field ``file`` (recommended).
+    2. Reference an existing on-disk ``audio_path`` — restricted to paths
+       inside the working directory (no absolute paths, no traversal).
+    """
     import os as _os
-    from fastapi import UploadFile, File
-    # If audio_path contains traversal or absolute path outside allowed dir, reject
-    if audio_path:
-        # disallow .., absolute paths, and non-existent
-        if ".." in audio_path or _os.path.isabs(audio_path):
-            raise HTTPException(status_code=400, detail="Invalid audio_path")
-        # restrict to data/ or temp allowed dirs or existing file
-        if not _os.path.exists(audio_path):
-            raise HTTPException(status_code=404, detail=f"Audio file not found: {audio_path}")
-    else:
-        raise HTTPException(status_code=400, detail="audio_path required (or upload file)")
+    import secrets as _secrets
+    import tempfile as _tempfile
+    import asyncio as _asyncio
+
+    tmp_path: Optional[str] = None
     try:
-        conv = process_call_audio(
-            audio_path=audio_path,
+        if file is not None and getattr(file, "filename", None):
+            # ── Upload path ────────────────────────────────
+            filename = _os.path.basename(file.filename or "call_audio")
+            ext = _os.path.splitext(filename)[1].lower()
+            if ext not in _UPLOAD_ALLOWED_EXT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported audio format {ext!r}. Allowed: {', '.join(_UPLOAD_ALLOWED_EXT)}",
+                )
+            tmp_dir = _tempfile.mkdtemp(prefix="leadsync_upload_")
+            tmp_path = _os.path.join(tmp_dir, f"{_secrets.token_hex(8)}{ext}")
+            total = 0
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _UPLOAD_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="Uploaded audio exceeds 50MB limit")
+                    out.write(chunk)
+            audio_file = tmp_path
+        elif audio_path:
+            # ── On-disk path path (confined) ───────────────
+            if ".." in audio_path or _os.path.isabs(audio_path):
+                raise HTTPException(status_code=400, detail="Invalid audio_path")
+            if not _os.path.exists(audio_path):
+                raise HTTPException(status_code=404, detail=f"Audio file not found: {audio_path}")
+            audio_file = audio_path
+        else:
+            raise HTTPException(status_code=400, detail="Provide a multipart 'file' upload or audio_path")
+
+        conv = await _asyncio.to_thread(
+            process_call_audio,
+            audio_path=audio_file,
             model_size=model_size,
             language=language,
             prospect_name=prospect_name,
         )
         scored = score_prospect(conversation=conv)
-        queue = get_queue()
-        queue.add(scored)
+        persist_conversation(conv)
+        persist_scored_prospect(scored)
+        get_queue().add(scored)
         return {
             "message": "Call processed and queued",
             "conversation_id": conv.id,
@@ -695,12 +946,23 @@ async def ingest_call(
             "transcript_preview": conv.raw_text[:200] + "..." if len(conv.raw_text) > 200 else conv.raw_text,
             "timestamp": datetime.utcnow().isoformat(),
         }
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException as e:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Call processing failed: {e}")
+    finally:
+        if tmp_path:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(_os.path.dirname(tmp_path), ignore_errors=True)
+            except Exception:
+                pass
 
 
 @app.post("/ingest/meeting", tags=["ingestion"])
@@ -711,6 +973,8 @@ async def ingest_meeting(
     try:
         conv = process_meeting_notes(notes=notes, source=source)
         scored = score_prospect(conversation=conv)
+        persist_conversation(conv)
+        persist_scored_prospect(scored)
         queue = get_queue()
         queue.add(scored)
         return {
@@ -843,9 +1107,19 @@ async def process_conversation_pipeline(
             )
 
         queue = get_queue()
+        persist_conversation(conversation)
+        persist_scored_prospect(scored)
         queue.add(scored)
 
         selected = select_draft(drafts, urgency_level=conversation.urgency or "medium") if drafts else None
+        if drafts:
+            persist_followup_draft(
+                conversation_id=conversation.id,
+                drafts=drafts,
+                prospect_name=prospect_name,
+                company=company,
+                selected_variant=selected,
+            )
 
         return {
             "status": "success",
@@ -929,12 +1203,95 @@ async def remove_from_queue(conversation_id: str) -> Dict[str, Any]:
 
 
 # ========== Email Tracking ==========
+# In-memory engagement tracker (flushes to DB via core.email_tracking)
+_TRACKING: Dict[str, "EmailTracking"] = {}
+_TRACKING_LOCK = _thr.Lock()
+
+
+def _get_tracker(prospect_id: str, email_address: str = "") -> EmailTracking:
+    with _TRACKING_LOCK:
+        t = _TRACKING.get(prospect_id)
+        if t is None:
+            t = EmailTracking(prospect_id, email_address or "")
+            _TRACKING[prospect_id] = t
+        return t
+
+
+def _lookup_prospect_email(prospect_id: str) -> str:
+    """Best-effort email lookup: live queue first, then DB history."""
+    try:
+        item = get_queue().get_by_id(prospect_id)
+        if item and item.conversation:
+            return item.conversation.primary_email
+    except Exception:
+        pass
+    try:
+        from core.database import get_db
+        from core.database.models import ConversationRecord
+        with get_db() as db:
+            rec = db.query(ConversationRecord).filter(ConversationRecord.id == prospect_id).first()
+            if rec and isinstance(rec.participants, dict):
+                emails = [p.get("email") for p in (rec.participants.get("participants") or rec.participants.get("list") or []) if isinstance(p, dict)]
+                if not emails and isinstance(rec.participants, dict):
+                    # participants stored as dict; try values
+                    emails = [v.get("email") for v in rec.participants.values() if isinstance(v, dict)]
+            elif rec and isinstance(rec.participants, list):
+                emails = [p.get("email") for p in rec.participants if isinstance(p, dict)]
+            else:
+                emails = []
+            return next((e for e in emails if e), "")
+    except Exception:
+        return ""
+
+
+def _mark_queue_response(prospect_id: str, response: str) -> None:
+    """Update a live queued prospect's response status after tracking signal."""
+    try:
+        item = get_queue().get_by_id(prospect_id)
+        if item:
+            item.response_status = response
+            item.last_action_at = datetime.utcnow()
+    except Exception:
+        pass
 
 
 @app.get("/tracking/pixel/{prospect_id}", tags=["tracking"])
-async def tracking_pixel(prospect_id: str) -> Response:
+async def tracking_pixel(
+    prospect_id: str,
+    h: Optional[str] = Query(None, description="Tracking hash (ignored, informational)"),
+) -> Response:
+    """
+    1x1 transparent GIF tracking pixel.
+
+    Records the open: in-memory engagement tracker + audit trail + DB
+    counters (via core.email_tracking) and marks a live queued prospect
+    as `opened`. Safe to call from email clients (no auth by design).
+    """
     pixel_data = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\x0a\x00\x3b"
-    return Response(content=pixel_data, media_type="image/gif")
+    email = _lookup_prospect_email(prospect_id)
+    tracker = _get_tracker(prospect_id, email)
+    tracker.log_open()
+    try:
+        from core.email_tracking import log_open_event
+        log_open_event(prospect_id, email)
+    except Exception:
+        pass
+    try:
+        from core.database.audit import audit
+        audit.log(
+            "tracking:open",
+            entity_type="prospect",
+            entity_id=prospect_id,
+            details={"opens": tracker.opens, "engagement_score": tracker.engagement_score()},
+        )
+    except Exception:
+        pass
+    _mark_queue_response(prospect_id, "opened")
+    return Response(
+        content=pixel_data,
+        media_type="image/gif",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @app.post("/tracking/click", tags=["tracking"])
@@ -942,11 +1299,53 @@ async def track_click(
     prospect_id: str = Form(...),
     link_url: str = Form(...),
 ) -> Dict[str, Any]:
+    """
+    Record a click on a tracked link: engagement tracker + audit + DB
+    counters, then mark a live queued prospect as `clicked`.
+    """
+    email = _lookup_prospect_email(prospect_id)
+    tracker = _get_tracker(prospect_id, email)
+    tracker.log_click(link_url)
+    try:
+        from core.email_tracking import log_click_event
+        log_click_event(prospect_id, email, link_url)
+    except Exception:
+        pass
+    try:
+        from core.database.audit import audit
+        audit.log(
+            "tracking:click",
+            entity_type="prospect",
+            entity_id=prospect_id,
+            details={"link_url": link_url, "clicks": tracker.clicks, "engagement_score": tracker.engagement_score()},
+        )
+    except Exception:
+        pass
+    _mark_queue_response(prospect_id, "clicked")
     return {
         "status": "tracked",
         "prospect_id": prospect_id,
         "link_url": link_url,
+        "clicks": tracker.clicks,
+        "engagement_score": tracker.engagement_score(),
         "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/tracking/engagement/{prospect_id}", tags=["tracking"])
+async def tracking_engagement(prospect_id: str) -> Dict[str, Any]:
+    """Get open/click stats and engagement score for a prospect."""
+    tracker = _TRACKING.get(prospect_id)
+    if tracker is None:
+        return {"prospect_id": prospect_id, "opens": 0, "clicks": 0, "engagement_score": 0.0, "status": "no_activity"}
+    return {
+        "prospect_id": prospect_id,
+        "opens": tracker.opens,
+        "clicks": tracker.clicks,
+        "last_opened": tracker.last_opened.isoformat() if tracker.last_opened else None,
+        "last_clicked": tracker.last_clicked.isoformat() if tracker.last_clicked else None,
+        "engagement_score": tracker.engagement_score(),
+        "status": "tracked",
     }
 
 
@@ -1233,19 +1632,24 @@ async def gmail_poll_now() -> Dict[str, Any]:
 
 @app.get("/auth/google/url", tags=["auth"])
 async def google_auth_url() -> Dict[str, Any]:
-    from core.ingest.gmail_api import get_auth_url
+    """Start the Google OAuth flow — returns the consent URL containing a
+    single-use CSRF state token that the callback must present back."""
+    from core.ingest.gmail_api import get_auth_url, create_oauth_state
     try:
-        url = get_auth_url()
-        return {"url": url}
+        state = create_oauth_state()
+        url = get_auth_url(state=state)
+        return {"url": url, "state": state}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/auth/google/callback", tags=["auth"])
-async def google_callback(code: str = Query(...)) -> Dict[str, Any]:
+async def google_callback(code: str = Query(...), state: Optional[str] = Query(None)) -> Dict[str, Any]:
     from core.ingest.gmail_api import handle_callback
     try:
-        data = handle_callback(code)
+        data = handle_callback(code, state=state)
         return {"connected": True, "email": data.get("email"), "message": f"Gmail connected as {data.get('email')}"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1389,7 +1793,7 @@ async def webhook_test(
         commitments=["test webhook integration"],
     )
     prospect = ScoredProspect(
-        conversation_id=f"wh-test-{int(time.time())}",
+        conversation_id=f"wh-test-{int(_time.time())}",
         priority_score=0.88,
         conversation=conv,
         sla_deadline=datetime.utcnow(),
@@ -1402,9 +1806,9 @@ async def webhook_test(
 
     def _test_channel(slug: str, send_fn) -> Dict[str, Any]:
         try:
-            start = time.time()
+            start = _time.time()
             success = send_fn(alert)
-            elapsed_ms = round((time.time() - start) * 1000)
+            elapsed_ms = round((_time.time() - start) * 1000)
             return {
                 "success": success,
                 "latency_ms": elapsed_ms,
@@ -1618,19 +2022,23 @@ async def backup_run(
     output_dir: str = Query("backups"),
     compress: bool = Query(True),
     rotate: int = Query(7, ge=0, le=100),
+    include_supplementary: bool = Query(False, description="Include dedup/suppression files. auth_config (secrets) is never copied via API."),
 ) -> Dict[str, Any]:
-    """Create a database backup."""
+    """Create a database backup (HTTP-triggered output confined to the project tree)."""
     from scripts.db_backup import run_backup
-    return run_backup(output_dir=output_dir, compress=compress, rotate=rotate)
+    result = run_backup(output_dir=output_dir, compress=compress, rotate=rotate, include_supplementary=include_supplementary, api_mode=True)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message", "Backup failed"))
+    return result
 
 
 @app.get("/backup/list", tags=["backup"])
 async def backup_list(
     output_dir: str = Query("backups"),
 ) -> Dict[str, Any]:
-    """List available backups."""
+    """List available backups (HTTP-confined)."""
     from scripts.db_backup import list_backups
-    backups = list_backups(output_dir)
+    backups = list_backups(output_dir, confined=True)
     return {"count": len(backups), "backups": backups}
 
 
@@ -1638,9 +2046,9 @@ async def backup_list(
 async def backup_verify(
     backup_path: str = Query(...),
 ) -> Dict[str, Any]:
-    """Verify a backup file."""
+    """Verify a backup file (HTTP-confined: only agent artifacts inside the project tree)."""
     from scripts.db_backup import verify_backup
-    return verify_backup(backup_path)
+    return verify_backup(backup_path, confined=True)
 
 
 # ========== Deduplication ==========
@@ -1699,6 +2107,70 @@ async def dedup_clear() -> Dict[str, Any]:
 # ========== Two-Factor Authentication ==========
 
 
+@app.post("/auth/login", tags=["auth"])
+async def auth_login(
+    username: str = Form(...),
+    password: str = Form(...),
+    totp_code: Optional[str] = Form(None),
+) -> Dict[str, Any]:
+    """
+    Login with username/password (+ TOTP code when 2FA is enabled).
+
+    Returns a bearer session token usable as `Authorization: Bearer <token>`
+    on every API endpoint (including the WebSocket `?api_key=` alternative).
+    Brute-force protected by per-account lockout and route rate limiting.
+    """
+    from core.auth import get_authenticator, get_2fa_status
+
+    auth = get_authenticator()
+    ok, message, user, token = auth.authenticate_token(username, password)
+    if not ok:
+        raise HTTPException(status_code=401, detail=message)
+
+    status = get_2fa_status(username)
+    if status.get("enabled"):
+        if not totp_code:
+            raise HTTPException(status_code=401, detail="2FA code required")
+        from core.auth import verify_2fa, use_backup_code
+        if not verify_2fa(username, totp_code):
+            backup = use_backup_code(username, totp_code)
+            if not backup.get("success"):
+                try:
+                    from core.database.audit import audit
+                    audit.log("auth:login_failed_2fa", entity_type="user", entity_id=username, details={})
+                except Exception:
+                    pass
+                raise HTTPException(status_code=401, detail="Invalid 2FA code")
+
+    # Session token minted by Authenticator._create_session
+    if not token:
+        raise HTTPException(status_code=500, detail="Session creation failed")
+
+    try:
+        from core.database.audit import audit
+        audit.log("auth:login", entity_type="user", entity_id=username, details={})
+    except Exception:
+        pass
+
+    return {
+        "token": token,
+        "token_type": "bearer",
+        "expires_in_hours": auth.config.get("session_ttl_hours", 24),
+        "user": user,
+    }
+
+
+@app.post("/auth/logout", tags=["auth"])
+async def auth_logout(authorization: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Invalidate the provided bearer session token."""
+    from core.auth import get_authenticator
+    token = (authorization or "").replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Provide the token via ?authorization=Bearer <token>")
+    get_authenticator().logout(token)
+    return {"logged_out": True}
+
+
 @app.post("/auth/2fa/enable", tags=["auth"])
 async def auth_2fa_enable(
     username: str = Form(...),
@@ -1731,7 +2203,28 @@ async def auth_2fa_verify(
 ) -> Dict[str, Any]:
     """Verify a 2FA code (for login)."""
     from core.auth import verify_2fa
+
+    # Per-username throttle (route-level limiter covers per-IP)
+    global _totp_verify_limiter
+    try:
+        _totp_verify_limiter
+    except NameError:
+        from core.middleware import RateLimiter
+        _totp_verify_limiter = RateLimiter(max_requests=5, window_seconds=300)
+    allowed, info = _totp_verify_limiter.is_allowed(username.lower())
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many 2FA attempts for this user. Try again in {info['retry_after']}s.",
+        )
+
     is_valid = verify_2fa(username, code)
+    if not is_valid:
+        try:
+            from core.database.audit import audit
+            audit.log("auth:2fa_failed", entity_type="user", entity_id=username, details={})
+        except Exception:
+            pass
     return {
         "valid": is_valid,
         "username": username,
@@ -1807,21 +2300,71 @@ async def auth_2fa_recovery_request(
     send_email: bool = Query(True),
     base_url: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
-    """Generate and optionally send a 2FA recovery link."""
+    """
+    Generate and optionally email a one-time 2FA recovery link.
+
+    SECURITY: the generated link is NEVER returned in the HTTP response.
+    It is delivered exclusively to the user's registered email address.
+    If SMTP is not configured, an administrator can retrieve pending
+    links server-side via GET /auth/2fa/recovery/pending, or explicitly
+    opt into dev-only exposure with RETURNS_LINK_IN_RESPONSE=true.
+    """
     from core.auth.recovery import generate_recovery_link, send_recovery_email
+
+    # Rate-limit recovery link generation per username (stop link spam)
+    global _recovery_limiter
+    try:
+        _recovery_limiter
+    except NameError:
+        from core.middleware import RateLimiter
+        _recovery_limiter = RateLimiter(max_requests=3, window_seconds=3600)
+    allowed, info = _recovery_limiter.is_allowed(username)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many recovery requests for this user. Try again in {info['retry_after']}s.",
+        )
 
     result = generate_recovery_link(username, base_url=base_url)
     if "error" in result:
-        return result
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    link = result["link"]
 
     if send_email:
-        email_result = send_recovery_email(username, result["link"])
-        result["email_sent"] = email_result.get("success", False)
-        if not email_result.get("success"):
-            result["manual_link"] = result["link"]
-            result["message"] += " Note: Email not configured. Provide link manually."
+        email_result = send_recovery_email(username, link)
+        email_sent = email_result.get("success", False)
+    else:
+        email_result = None
+        email_sent = False
 
-    return result
+    response: Dict[str, Any] = {
+        "success": True,
+        "username": username,
+        "expires_at": result.get("expires_at"),
+        "email_sent": email_sent,
+        "message": (
+            "Recovery link generated and emailed to the registered address."
+            if email_sent
+            else "Recovery link generated but SMTP is not configured. "
+                 "Contact your administrator to retrieve it server-side."
+        ),
+    }
+
+    # Explicit, non-default escape hatch for local development ONLY.
+    if (os.environ.get("RETURNS_LINK_IN_RESPONSE", "") or "").lower() == "true":
+        response["link"] = link
+        response["message"] += " (dev mode: link included in response)"
+
+    if not email_sent:
+        # Server-side log so an operator can retrieve it without HTTP exposure
+        logger.warning(
+            f"2FA recovery link for '{username}' NOT emailed — retrieve via "
+            f"GET /auth/2fa/recovery/pending from the server, or check server logs."
+        )
+        logger.warning(f"Recovery link (server-side only): {link}")
+
+    return response
 
 
 @app.post("/auth/2fa/recovery/redeem", tags=["auth"])
@@ -1841,7 +2384,7 @@ async def auth_2fa_recovery_redeem(
         link_data = _recovery_links.get(token_hash)
         if link_data is None:
             return {"error": "Invalid token", "success": False}
-        if time.time() > link_data["expires_at"]:
+        if _time.time() > link_data["expires_at"]:
             return {"error": "Token expired", "success": False}
         if link_data["used"]:
             return {"error": "Token already used", "success": False}
@@ -2058,5 +2601,49 @@ async def validation_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    # Never leak internal exception text to clients; full details only in logs
     logger.error(f"Unhandled error at {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(exc)})
+    debug = bool(getattr(settings, "debug", False))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": "An internal error occurred. Check the server logs." if not debug else str(exc),
+        },
+    )
+
+def main():
+    """Console-script entry point (`sales-followup`). Runs uvicorn."""
+    import uvicorn
+
+    run_settings = get_settings()
+    auth_on = bool(run_settings.auth_required)
+    configured = False
+    try:
+        configured = _api_keys_configured()
+    except Exception:
+        pass
+    mode = (
+        "ENFORCED (keys configured)"
+        if auth_on and configured
+        else "ENFORCED but NO KEYS CONFIGURED - mutating endpoints return 503"
+        if auth_on
+        else "DISABLED (AUTH_REQUIRED=false)"
+    )
+    print(
+        "=" * 60 + "\n"
+        "  LeadSync API\n"
+        f"  http://{run_settings.host}:{run_settings.port}  |  docs: /docs\n"
+        f"  API auth: {mode}\n"
+        "=" * 60
+    )
+    uvicorn.run(
+        "api.app:app",
+        host=run_settings.host,
+        port=run_settings.port,
+        log_level="info" if not run_settings.debug else "debug",
+    )
+
+
+if __name__ == "__main__":
+    main()

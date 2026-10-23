@@ -29,6 +29,42 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("Export")
 
+# ── CSV formula-injection hardening (CWE-1236) ─────────────────
+# Characters that make spreadsheet applications (Excel, LibreOffice,
+# Google Sheets) treat a cell as a formula, plus TAB/CR/LF and
+# common space look-alikes used to disguise leading formulas.
+CSV_FORMULA_PREFIXES = (
+    "=", "+", "-", "@",
+    "\t", "\r", "\n",
+    "\x20",         # regular space (leading spaces are also risky in Excel)
+    "\xa0",         # no-break space
+    "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005",
+    "\u2006", "\u2007", "\u2008", "\u2009", "\u200a",  # en/em/thin spaces
+    "\u3000",       # ideographic space
+)
+
+
+def _sanitize_csv_value(value):
+    """Neutralize spreadsheet formula injection. Returns raw string unchanged otherwise."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(CSV_FORMULA_PREFIXES):
+        # A leading apostrophe makes spreadsheets treat the cell as text.
+        # Embedded quoting/escaping is left to the csv writer.
+        return "'" + value
+    return value
+
+
+def _pdf_safe(text):
+    """Make text safe for latin-1 core fonts used by fpdf (fpdf2).
+
+    Replaces characters outside latin-1 (emoji, CJK, curly quotes, ...)
+    with '?' so the PDF export never crashes on non-latin-1 input.
+    """
+    if isinstance(text, str):
+        return text.encode("latin-1", errors="replace").decode("latin-1")
+    return text
+
 
 class ExportManager:
     """
@@ -383,7 +419,7 @@ class ExportManager:
 
         # Title
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, title, ln=True)
+        pdf.cell(0, 10, _pdf_safe(title), ln=True)
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(0, 8, f"Generated: {datetime.utcnow().isoformat()}Z", ln=True)
         pdf.cell(0, 8, f"Total records: {len(rows)}", ln=True)
@@ -397,12 +433,12 @@ class ExportManager:
 
             # Header
             pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(0, 7, f"Conversation #{i} - {row['source'].upper()}", ln=True)
+            pdf.cell(0, 7, _pdf_safe(f"Conversation #{i} - {row['source'].upper()}"), ln=True)
 
             # Metadata
             pdf.set_font("Helvetica", "", 9)
-            pdf.cell(0, 5, f"ID: {row['id'][:16]}...  |  Urgency: {row['urgency']}  |  Sentiment: {row['sentiment']}", ln=True)
-            pdf.cell(0, 5, f"Date: {row['conversation_date']}  |  Ingested: {row['ingested_at']}", ln=True)
+            pdf.cell(0, 5, _pdf_safe(f"ID: {row['id'][:16]}...  |  Urgency: {row['urgency']}  |  Sentiment: {row['sentiment']}"), ln=True)
+            pdf.cell(0, 5, _pdf_safe(f"Date: {row['conversation_date']}  |  Ingested: {row['ingested_at']}"), ln=True)
 
             if row.get("deal_size"):
                 pdf.cell(0, 5, f"Deal Size: ${row['deal_size']:,.0f}", ln=True)
@@ -412,7 +448,7 @@ class ExportManager:
                 participants = json.loads(row["participants"]) if isinstance(row["participants"], str) else row["participants"]
                 if participants:
                     names = [p.get("name", p.get("email", "?")) for p in participants]
-                    pdf.cell(0, 5, f"Participants: {', '.join(names)}", ln=True)
+                    pdf.cell(0, 5, _pdf_safe(f"Participants: {', '.join(names)}"), ln=True)
             except Exception:
                 pass
 
@@ -420,14 +456,14 @@ class ExportManager:
             raw = row.get("raw_text", "")
             if raw:
                 pdf.set_font("Helvetica", "", 8)
-                pdf.multi_cell(0, 4, f"Content: {raw[:400]}{'...' if len(raw) > 400 else ''}")
+                pdf.multi_cell(0, 4, _pdf_safe(f"Content: {raw[:400]}{'...' if len(raw) > 400 else ''}"))
 
             # Commitments
             commitments = row.get("commitments", [])
             if commitments:
                 pdf.set_font("Helvetica", "I", 8)
                 for c in commitments[:3]:
-                    pdf.cell(0, 4, f"  - {c}", ln=True)
+                    pdf.cell(0, 4, _pdf_safe(f"  - {c}"), ln=True)
 
             pdf.ln(3)
 
@@ -448,7 +484,7 @@ class ExportManager:
 
         # Title
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, title, ln=True)
+        pdf.cell(0, 10, _pdf_safe(title), ln=True)
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(0, 8, f"Generated: {datetime.utcnow().isoformat()}Z", ln=True)
         pdf.cell(0, 8, f"Total entries: {len(rows)}", ln=True)
@@ -482,7 +518,7 @@ class ExportManager:
             ok = "Y" if row["success"] else "N"
 
             for w, val in zip(col_widths, [ts, action, etype, eid, actor, details, ok]):
-                pdf.cell(w, 5, val, border=1)
+                pdf.cell(w, 5, _pdf_safe(val), border=1)
             pdf.ln()
 
         # Footer
@@ -502,7 +538,7 @@ class ExportManager:
 
         # Title
         pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 12, title, ln=True)
+        pdf.cell(0, 12, _pdf_safe(title), ln=True)
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(0, 8, f"Generated: {datetime.utcnow().isoformat()}Z", ln=True)
         pdf.ln(8)
@@ -543,9 +579,11 @@ class ExportManager:
         pdf.ln(10)
         pdf.set_font("Helvetica", "I", 9)
         pdf.multi_cell(0, 5,
-            "This report was generated by LeadSync. "
-            "For questions about data retention or GDPR/CCPA compliance, "
-            "contact the system administrator."
+            _pdf_safe(
+                "This report was generated by LeadSync. "
+                "For questions about data retention or GDPR/CCPA compliance, "
+                "contact the system administrator."
+            )
         )
 
         # Footer
@@ -558,7 +596,7 @@ class ExportManager:
     # ── Helpers ───────────────────────────────────────────────
 
     def _write_csv(self, path: str, rows: List[Dict]) -> None:
-        """Write rows to a CSV file."""
+        """Write rows to a CSV file, neutralizing spreadsheet formula injection."""
         if not rows:
             # Create empty file with header
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -569,7 +607,11 @@ class ExportManager:
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(rows)
+            for row in rows:
+                writer.writerow({
+                    key: _sanitize_csv_value(str(v)) if v is not None else ""
+                    for key, v in row.items()
+                })
 
 
 # ── Global instance ────────────────────────────────────────────
