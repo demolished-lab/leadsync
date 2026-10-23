@@ -23,7 +23,45 @@ def _token_path() -> Path:
     except:
         return Path(os.environ.get("GMAIL_TOKEN_PATH", "data/gmail_token.json"))
 
-def get_auth_url() -> str:
+# ── OAuth state store (CSRF protection) ───────────────────────
+import secrets as _secrets
+import threading as _auth_lock
+
+_STATE_TTL_SECONDS = 600
+_oauth_states: dict = {}  # state -> expiry (monotonic)
+_states_lock = _auth_lock.Lock()
+
+
+def _new_oauth_state() -> str:
+    """Create a one-time state param that must round-trip via Google."""
+    state = _secrets.token_urlsafe(32)
+    with _states_lock:
+        now = _time_monotonic()
+        # purge expired
+        for k in [k for k, exp in _oauth_states.items() if now > exp]:
+            _oauth_states.pop(k, None)
+        _oauth_states[state] = now + _STATE_TTL_SECONDS
+    return state
+
+
+def _consume_oauth_state(state: Optional[str]) -> bool:
+    """Validate and consume a state token (single use)."""
+    if not state:
+        return False
+    with _states_lock:
+        expiry = _oauth_states.pop(state, None)
+    return expiry is not None and _time_monotonic() <= expiry
+
+
+def _time_monotonic():
+    import time
+    return time.time()
+
+
+def get_auth_url(state: Optional[str] = None) -> str:
+    """Build the Google consent URL. When `state` is given it must be an
+    unused token created via create_oauth_state(); it round-trips through
+    Google and is verified in the callback."""
     from ..config import get_settings
     s = get_settings()
     if not s.google_client_id or not s.google_client_secret:
@@ -42,10 +80,24 @@ def get_auth_url() -> str:
         scopes=SCOPES,
         redirect_uri=s.google_redirect_uri,
     )
-    url, _ = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true")
+    kwargs = {}
+    if state:
+        kwargs["state"] = state
+    url, actual_state = flow.authorization_url(
+        access_type="offline", prompt="consent", include_granted_scopes="true", **kwargs
+    )
     return url
 
-def handle_callback(code: str, redirect_uri: Optional[str] = None) -> dict:
+
+def create_oauth_state() -> str:
+    """Create and register a single-use OAuth state token."""
+    return _new_oauth_state()
+
+
+def handle_callback(code: str, redirect_uri: Optional[str] = None, state: Optional[str] = None) -> dict:
+    # CSRF: reject callbacks without a valid, previously-created state token
+    if not _consume_oauth_state(state):
+        raise RuntimeError("Invalid or missing OAuth state parameter (CSRF protection)")
     from ..config import get_settings
     s = get_settings()
     from google_auth_oauthlib.flow import Flow
@@ -84,6 +136,11 @@ def handle_callback(code: str, redirect_uri: Optional[str] = None) -> dict:
     p = _token_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2))
+    # Restrict the token file to the owner (no group/world read)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
     logger.info(f"Gmail OAuth saved for {email} -> {p}")
     return data
 

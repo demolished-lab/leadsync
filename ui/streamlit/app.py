@@ -36,6 +36,22 @@ from core.ingest.email import add_suppression, is_suppressed
 from core.realtime import event_bus
 from core.auth import get_authenticator, require_role, is_admin
 
+
+def _api_base() -> str:
+    """Resolve the FastAPI backend base URL.
+
+    Priority: API_BASE_URL env var > settings.api_base_url > default localhost.
+    """
+    base = os.environ.get("API_BASE_URL") or ""
+    if not base:
+        try:
+            base = getattr(get_settings(), "api_base_url", "") or ""
+        except Exception:
+            base = ""
+    base = str(base).strip().rstrip("/")
+    return base or "http://localhost:8000"
+
+
 # ─── Page Config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Sales Follow-Up Agent",
@@ -351,7 +367,7 @@ def show_login_page():
             if st.button("🌐 Sign in with Google (OAuth 2.0)", type="primary", use_container_width=True, key="login_g_oauth_btn"):
                 try:
                     import httpx
-                    r = httpx.get("http://localhost:8000/auth/google/url", timeout=5)
+                    r = httpx.get(f"{_api_base()}/auth/google/url", timeout=5)
                     url = r.json().get("url", "")
                     if url:
                         st.link_button("👉 Click here to complete Google OAuth 2.0 Sign-In →", url, use_container_width=True)
@@ -543,7 +559,7 @@ def show_google_sign_in_page(user_data: Dict):
                 if st.button("🔐 Sign in with Google (OAuth)", type="primary", use_container_width=True, key="g_oauth_btn"):
                     try:
                         import httpx
-                        r = httpx.get("http://localhost:8000/auth/google/url", timeout=5)
+                        r = httpx.get(f"{_api_base()}/auth/google/url", timeout=5)
                         url = r.json().get("url", "")
                         if url:
                             st.link_button("👉 Click here to authorize with Google →", url, use_container_width=True)
@@ -1448,7 +1464,7 @@ elif page == "⚙️ Settings":
                 if st.button("🔐 Sign in with Google", type="primary", use_container_width=True, key="setup_google_signin"):
                     try:
                         import httpx
-                        r = httpx.get("http://localhost:8000/auth/google/url", timeout=5)
+                        r = httpx.get(f"{_api_base()}/auth/google/url", timeout=5)
                         url = r.json().get("url", "")
                         if url:
                             st.link_button("Continue to Google →", url, use_container_width=True)
@@ -1876,7 +1892,7 @@ elif page == "👥 Users" and is_admin(user):
             )
             recovery_base_url = st.text_input(
                 "Base URL",
-                value="http://localhost:8000",
+                value=_api_base(),
                 key="recovery_base_url",
             )
             recovery_send_email = st.checkbox("Send via Email", value=True, key="recovery_send_email")
@@ -2332,8 +2348,12 @@ elif page == "\U0001f50d Webhook Inspector":
                 mime="application/json",
             )
         if col3.button("\U0001f9f9 Cleanup Expired", key="cleanup_inspector"):
-            from core.alerts.inspector import cleanup_expired_links
-            st.info("Inspector has no expired entries to clean up.")
+            try:
+                from core.alerts.inspector import cleanup_expired_links
+            except ImportError:
+                st.error("Inspector module unavailable — cannot clean up expired entries.")
+            else:
+                st.info("Inspector has no expired entries to clean up.")
 
     with tab_capture:
         st.subheader("Manual Payload Capture")

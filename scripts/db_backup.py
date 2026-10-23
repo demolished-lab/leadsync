@@ -112,6 +112,43 @@ def _timestamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
 
+# ── Path confinement (anti-traversal / anti file-read oracle) ──
+
+def _confinement_error(path: str, what: str) -> Optional[str]:
+    """
+    Return an error message if `path` may not be used for `what`
+    ("write" for backup output dir, "read" for verify/list/restore).
+
+    Read access is restricted to agent artifact names inside the project
+    tree — this prevents `/backup/verify?backup_path=.env` (or any other
+    credential file) from being used as an arbitrary file-read oracle.
+    """
+    abs_path = os.path.realpath(os.path.abspath(path))
+    project_root = os.path.realpath(PROJECT_ROOT)
+    fname = os.path.basename(abs_path)
+
+    if what == "write":
+        if not abs_path.startswith(project_root + os.sep):
+            return f"Output directory must be inside the project tree ({project_root})"
+        return None
+
+    if not abs_path.startswith(project_root + os.sep):
+        return f"Path must be inside the project tree ({project_root})"
+    allowed_ext = (".sql", ".gz", ".db", ".json")
+    covers_supplementary = any(
+        k in fname for k in ("dedup_cache", "suppressions", "auth_config", "manifest")
+    )
+    if not (fname.startswith("sfa_") or covers_supplementary):
+        return "Only agent backup artifacts (sfa_* or known supplementary files) can be accessed"
+    if not fname.endswith(allowed_ext):
+        return f"Unsupported file type. Allowed suffixes: {', '.join(allowed_ext)}"
+    # Bare credential files are never readable, even inside the project tree
+    secret_names = (".env", "gmail_token.json", "auth_config.yaml", "auth_config.json")
+    if fname in secret_names:
+        return "Access to credential files is not allowed"
+    return None
+
+
 # ── Backup ─────────────────────────────────────────────────────
 
 
@@ -300,8 +337,16 @@ def _backup_postgres_sqlalchemy(pg: Dict[str, str], output_path: str) -> Dict[st
     }
 
 
-def backup_supplementary(output_dir: str, compress: bool = False) -> List[Dict[str, Any]]:
-    """Backup supplementary files: dedup cache, suppressions, auth config."""
+def backup_supplementary(
+    output_dir: str,
+    compress: bool = False,
+    include_auth_config: bool = True,
+) -> List[Dict[str, Any]]:
+    """Backup supplementary files: dedup cache, suppressions, auth config.
+
+    ``include_auth_config=False`` (used by the HTTP API) skips auth_config.yaml
+    because it contains password hashes and TOTP secrets.
+    """
     files_to_backup = []
 
     # Dedup cache
@@ -314,10 +359,11 @@ def backup_supplementary(output_dir: str, compress: bool = False) -> List[Dict[s
     if os.path.exists(suppressions_path):
         files_to_backup.append(("suppressions.txt", suppressions_path))
 
-    # Auth config
-    auth_path = os.environ.get("AUTH_CONFIG_PATH", os.path.join(PROJECT_ROOT, "auth_config.yaml"))
-    if os.path.exists(auth_path):
-        files_to_backup.append(("auth_config.yaml", auth_path))
+    # Auth config — gated, it contains secrets
+    if include_auth_config:
+        auth_path = os.environ.get("AUTH_CONFIG_PATH", os.path.join(PROJECT_ROOT, "auth_config.yaml"))
+        if os.path.exists(auth_path):
+            files_to_backup.append(("auth_config.yaml", auth_path))
 
     results = []
     ts = _timestamp()
@@ -352,8 +398,20 @@ def run_backup(
     compress: bool = True,
     rotate: int = 7,
     include_supplementary: bool = True,
+    api_mode: bool = False,
 ) -> Dict[str, Any]:
-    """Run a full backup."""
+    """Run a full backup.
+
+    ``api_mode=True`` (HTTP endpoint) also excludes auth_config.yaml from
+    supplementary files — secrets must not be copied via API-triggered
+    backups.
+    """
+    if api_mode:
+        # Path confinement for HTTP-triggered backups
+        confinement = _confinement_error(os.path.abspath(output_dir), "write")
+        if confinement:
+            return {"status": "error", "message": confinement}
+
     os.makedirs(output_dir, exist_ok=True)
     db_url = _get_db_url()
 
@@ -397,7 +455,7 @@ def run_backup(
     # Supplementary files
     if include_supplementary:
         print(f"\n  Backing up supplementary files...")
-        supp_results = backup_supplementary(output_dir, compress=compress)
+        supp_results = backup_supplementary(output_dir, compress=compress, include_auth_config=not api_mode)
         result["supplementary"] = supp_results
         for s in supp_results:
             size_kb = s["size_bytes"] / 1024
@@ -618,8 +676,16 @@ def run_restore(backup_path: str, restore_supplementary_files: bool = True) -> D
 # ── List & Verify ──────────────────────────────────────────────
 
 
-def list_backups(output_dir: str = "backups") -> List[Dict[str, Any]]:
-    """List all backups in a directory."""
+def list_backups(output_dir: str = "backups", confined: bool = False) -> List[Dict[str, Any]]:
+    """List all backups in a directory.
+
+    ``confined=True`` (HTTP endpoint) restricts the directory to the
+    project tree to prevent using the API as a directory-probing oracle.
+    """
+    if confined:
+        confinement = _confinement_error(os.path.abspath(os.path.join(output_dir, "x")), "read")
+        if confinement:
+            return []
     if not os.path.exists(output_dir):
         return []
 
@@ -641,8 +707,17 @@ def list_backups(output_dir: str = "backups") -> List[Dict[str, Any]]:
     return backups
 
 
-def verify_backup(backup_path: str) -> Dict[str, Any]:
-    """Verify a backup file is valid."""
+def verify_backup(backup_path: str, confined: bool = False) -> Dict[str, Any]:
+    """Verify a backup file is valid.
+
+    ``confined=True`` (HTTP endpoint) applies path confinement so the
+    endpoint cannot act as a file-read oracle.
+    """
+    if confined:
+        # Path confinement — this endpoint must not act as a file-read oracle
+        confinement = _confinement_error(backup_path, "read")
+        if confinement:
+            return {"status": "error", "message": confinement}
     if not os.path.exists(backup_path):
         return {"status": "error", "message": f"File not found: {backup_path}"}
 

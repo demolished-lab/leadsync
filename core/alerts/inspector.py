@@ -296,6 +296,33 @@ class WebhookInspector:
             self._entries.clear()
         return count
 
+    def cleanup_expired(self, max_age_seconds: Optional[float] = None) -> int:
+        """
+        Remove captured entries older than ``max_age_seconds``.
+
+        Args:
+            max_age_seconds: Entries with a ``timestamp_unix`` older than
+                ``now - max_age_seconds`` are considered expired and removed.
+                Defaults to ``WEBHOOK_INSPECTOR_MAX_AGE_SECONDS`` from the
+                environment, or DEFAULT_MAX_AGE_SECONDS (24h).
+
+        Returns:
+            Number of entries removed (0 on any failure).
+        """
+        try:
+            if max_age_seconds is None:
+                max_age_seconds = _default_max_age_seconds()
+            cutoff = time.time() - max_age_seconds
+            with self._lock:
+                before = len(self._entries)
+                self._entries = [
+                    e for e in self._entries
+                    if (e.get("timestamp_unix") or 0) >= cutoff
+                ]
+                return before - len(self._entries)
+        except Exception:
+            return 0
+
     def export_json(self, limit: int = 1000) -> str:
         """Export entries as JSON string."""
         entries = self.get_entries(limit=limit)
@@ -338,33 +365,106 @@ class WebhookInspector:
 
 # ── Global Inspector Instance ─────────────────────────────────
 
+import os
+
 _inspector: Optional[WebhookInspector] = None
+
+# Captured entries older than this are considered expired for
+# cleanup_expired_links(). Can be overridden via env var.
+DEFAULT_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _default_max_age_seconds() -> float:
+    """Get the inspector entry retention window (seconds)."""
+    try:
+        return float(os.environ.get(
+            "WEBHOOK_INSPECTOR_MAX_AGE_SECONDS",
+            str(DEFAULT_MAX_AGE_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_AGE_SECONDS
 
 
 def get_inspector() -> WebhookInspector:
     """Get the global webhook inspector instance."""
     global _inspector
     if _inspector is None:
-        max_entries = int(__import__("os").environ.get("WEBHOOK_INSPECTOR_MAX_ENTRIES", "1000"))
-        enabled = __import__("os").environ.get("WEBHOOK_INSPECTOR_ENABLED", "true").lower() == "true"
+        max_entries = int(os.environ.get("WEBHOOK_INSPECTOR_MAX_ENTRIES", "1000"))
+        enabled = os.environ.get("WEBHOOK_INSPECTOR_ENABLED", "true").lower() == "true"
         _inspector = WebhookInspector(max_entries=max_entries, enabled=enabled)
     return _inspector
 
 
-def wrap_alert_channels(alert_manager: Any) -> None:
+def cleanup_expired_links() -> int:
     """
-    Wrap all channels in an AlertManager with the inspector.
+    Remove expired captured payload/link entries from the global inspector.
 
-    This should be called after channels are registered.
+    Safe to call from any context (UI, background thread, tests): if the
+    store is empty or the inspector is unavailable, returns 0 and never
+    raises.
+
+    Returns:
+        Number of expired entries removed.
+    """
+    try:
+        return get_inspector().cleanup_expired()
+    except Exception:
+        return 0
+
+
+def wrap_channel(
+    channel: Any,
+    channel_name: Optional[str] = None,
+    channel_type: Optional[str] = None,
+) -> Any:
+    """
+    Wrap a sender (or a list of senders) with the inspector.
+
+    Accepts either a single channel function/sender (returns a single wrapped
+    send function) or a list/tuple of them (returns a list in the same order).
+    Neither the input-channel call semantics nor the bool return value are
+    changed; the call simply passes through to the underlying sender.
+
+    Already-wrapped channels are returned as-is (double-wrap guard).
     """
     inspector = get_inspector()
-    wrapped_channels = []
-    for channel in alert_manager._channels:
-        if getattr(channel, "_inspector_wrapped", False):
-            # Already wrapped
-            wrapped_channels.append(channel)
-        else:
-            name = getattr(channel, "__name__", str(channel))
-            wrapped = inspector.wrap_channel(channel, channel_name=name)
-            wrapped_channels.append(wrapped)
-    alert_manager._channels = wrapped_channels
+    if isinstance(channel, (list, tuple)):
+        return [wrap_channel(fn, channel_name=channel_name, channel_type=channel_type) for fn in channel]
+    if getattr(channel, "_inspector_wrapped", False):
+        return channel
+    return inspector.wrap_channel(
+        channel,
+        channel_name=channel_name,
+        channel_type=channel_type,
+    )
+
+
+def wrap_alert_channels(alert_manager: Any) -> Any:
+    """
+    Wrap alert channels with the payload inspector.
+
+    Accepts either:
+      - An AlertManager (all channels in ``_channels`` are wrapped in place).
+      - A single sender/channel function (returns the wrapped send function).
+      - A list/tuple of senders (returns a list of wrapped send functions).
+
+    Idempotent: channels already carrying ``_inspector_wrapped`` are left
+    untouched, so calling this twice never double-wraps.
+    """
+    # Case 1: an AlertManager-like object → wrap all registered channels
+    if hasattr(alert_manager, "_channels") and not callable(alert_manager):
+        inspector = get_inspector()
+        wrapped_channels = []
+        for channel in alert_manager._channels:
+            if getattr(channel, "_inspector_wrapped", False):
+                # Already wrapped
+                wrapped_channels.append(channel)
+            else:
+                name = getattr(channel, "__name__", str(channel))
+                wrapped = inspector.wrap_channel(channel, channel_name=name)
+                wrapped_channels.append(wrapped)
+        alert_manager._channels = wrapped_channels
+        return wrapped_channels
+
+    # Case 2: single sender or list of senders
+    return wrap_channel(alert_manager)

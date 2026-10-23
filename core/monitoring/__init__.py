@@ -56,9 +56,9 @@ class _Metrics:
     def export(self) -> str:
         """Export all metrics in Prometheus text exposition format."""
         lines = []
-        lines.append("# HELP sfa_uptime_seconds Time since process start")
-        lines.append("# TYPE sfa_uptime_seconds gauge")
-        lines.append(f"sfa_uptime_seconds {time.time() - self._start_time:.2f}")
+        lines.append("# HELP leadsync_uptime_seconds Time since process start")
+        lines.append("# TYPE leadsync_uptime_seconds gauge")
+        lines.append(f"leadsync_uptime_seconds {time.time() - self._start_time:.2f}")
         lines.append("")
 
         with self._lock:
@@ -76,25 +76,48 @@ class _Metrics:
                 lines.append(f"{key} {value:.2f}")
             lines.append("")
 
-            # Histograms
+            # Histograms — labels survive bucket expansion intact
             for key, observations in sorted(self._histograms.items()):
-                metric_name = key.split("{")[0] if "{" in key else key
+                metric_name, base_labels = self._parse_key(key)
                 lines.append(f"# TYPE {metric_name} histogram")
                 if observations:
                     sorted_obs = sorted(observations)
                     count = len(sorted_obs)
                     total = sum(sorted_obs)
-                    lines.append(f"{key}_count {count}")
-                    lines.append(f"{key}_sum {total:.4f}")
-                    # Bucket boundaries
+                    lines.append(f"{self._label_key(metric_name, base_labels)}_count {count}")
+                    lines.append(f"{self._label_key(metric_name, base_labels)}_sum {total:.4f}")
+                    # Bucket boundaries (cumulative counts) — le first, then series labels
+                    def bucket_name(le: str) -> str:
+                        return self._label_key(
+                            f"{metric_name}_bucket",
+                            {**base_labels, "le": le},
+                        )
                     for bucket in [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]:
                         cumcount = sum(1 for o in sorted_obs if o <= bucket)
-                        label_part = key[key.index("{"):] if "{" in key else ""
-                        lines.append(f'{metric_name}_bucket{{le="{bucket}"{label_part[1:]}}}{cumcount}')
-                    lines.append(f'{metric_name}_bucket{{le="+Inf"{key[key.index("{"):][1:] if "{" in key else ""}}}{count}')
+                        lines.append(f'{bucket_name(str(bucket))} {cumcount}')
+                    lines.append(f'{bucket_name("+Inf")} {count}')
             lines.append("")
 
         return "\n".join(lines)
+
+    def _parse_key(self, key: str):
+        """Split 'name{a="x",b="y"}' back into ('name', {'a': 'x', 'b': 'y'})."""
+        if "{" not in key:
+            return key, {}
+        name = key.split("{", 1)[0]
+        inner = key[key.index("{") + 1 : key.rindex("}")]
+        labels: Dict[str, str] = {}
+        import csv as _csv
+        try:
+            reader = _csv.reader([inner])
+            parts = next(reader) if inner else []
+            for part in parts:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    labels[k.strip()] = v.strip().strip('"')
+        except Exception:
+            labels = {}
+        return name, labels
 
 
 # Global singleton
@@ -104,32 +127,32 @@ metrics = _Metrics()
 def record_request(method: str, path: str, status: int, duration: float) -> None:
     """Record an HTTP request metric."""
     labels = {"method": method, "path": path, "status": str(status)}
-    metrics.inc("sfa_http_requests_total", labels=labels)
-    metrics.observe("sfa_http_request_duration_seconds", duration, labels=labels)
+    metrics.inc("leadsync_http_requests_total", labels=labels)
+    metrics.observe("leadsync_http_request_duration_seconds", duration, labels=labels)
 
 
 def record_llm_call(provider: str, model: str, latency: float, success: bool) -> None:
     """Record an LLM call metric."""
     labels = {"provider": provider, "model": model, "success": str(success).lower()}
-    metrics.inc("sfa_llm_calls_total", labels=labels)
-    metrics.observe("sfa_llm_call_duration_seconds", latency, labels=labels)
+    metrics.inc("leadsync_llm_calls_total", labels=labels)
+    metrics.observe("leadsync_llm_call_duration_seconds", latency, labels=labels)
 
 
 def record_queue_depth(depth: int) -> None:
     """Record current queue depth."""
-    metrics.gauge("sfa_queue_depth", depth)
+    metrics.gauge("leadsync_queue_depth", depth)
 
 
 def record_sla_breach(count: int) -> None:
     """Record SLA breach count."""
-    metrics.gauge("sfa_sla_breaches", count)
+    metrics.gauge("leadsync_sla_breaches", count)
 
 
 def record_draft_generated(tone: str) -> None:
     """Record a draft generation event."""
-    metrics.inc("sfa_drafts_generated_total", labels={"tone": tone})
+    metrics.inc("leadsync_drafts_generated_total", labels={"tone": tone})
 
 
 def record_email_sent(status: str) -> None:
     """Record an email send event."""
-    metrics.inc("sfa_emails_sent_total", labels={"status": status})
+    metrics.inc("leadsync_emails_sent_total", labels={"status": status})

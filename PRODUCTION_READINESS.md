@@ -8,12 +8,12 @@
 | **Email ingest** | `_heuristic_extract` discarded urgency/deal; added `_heuristic_urgency_and_deal()` and wired into `fetch_emails` + `parse_email_to_conversation`; `send_email` multipart was reassigning `msg` then calling `attach` on `MIMEText` → fixed to `MIMEMultipart('alternative')` |
 | **Scorer** | `recency_days` used `.days` (int) → switched to `total_seconds()/86400` fractional days |
 | **LLM manager** | Cascade matching `avail.startswith(m.split(":")[0])` falsely matched `llama3.1:70b` for `llama3.1:8b` → strict exact/prefix+tag check |
-| **Auth** | SHA-256+salt → `bcrypt` via `passlib[bcrypt]` with SHA fallback; default `admin123` → random `token_urlsafe(16)` unless `ADMIN_PASSWORD` set; API keys now indexed by `sha256(key)[:16]` not 12-char prefix (collision-free), `revoke_key` scans hashes |
+| **Auth** | SHA-256+salt → `bcrypt` via `passlib[bcrypt]` with SHA fallback; default `admin123` → random `token_urlsafe(16)` unless `ADMIN_PASSWORD` set; API-key *registration* is indexed by `sha256(key)[:16]` not a 12-char prefix (collision-free), `revoke_key` scans hashes. `APIKeyVerifier.verify()` now hashes the presented key and matches via `key_hash` (bcrypt), with constant-time comparison for raw `API_KEYS` env keys — prefix matching removed |
 | **TOTP** | Custom base32 decode → `base64.b32decode` with fallback |
 | **Queue** | No max enforcement → `PriorityQueue(max_items=50)` evicts lowest priority non-breached; exposes `max_items` override for tests |
 | **Retry** | Duplicate `RetryConfig/RetryResult` classes + `max_attempts` vs `max_retries` mismatch → unified dataclass with compat alias `max_attempts` on config |
 | **Realtime** | `asyncio.get_event_loop()` deprecated → `get_running_loop()` with early return when no loop |
-| **Middleware** | `X-Forwarded-For` trusted blindly → only trusts if `client_host in TRUSTED_PROXIES` (env `TRUSTED_PROXIES`) + IP regex validation |
+| **Middleware** | Rate-limit XFF bypass fixed: a client-supplied `X-Forwarded-For` is honored ONLY when the direct peer (`request.client.host`) is listed in `TRUSTED_PROXIES` (comma-separated) and passes IP validation. **`TRUSTED_PROXIES` must list your actual proxy/LB IPs**; leave it unset only when the app is exposed directly. Both the HTTP middleware (`api/app.py`) and `core/middleware` use the shared `resolve_client_ip()` helper |
 | **API** | `@app.on_event` deprecated → `lifespan` context manager; global `Exception` handler swallowed `HTTPException` → split into `StarletteHTTPException`, `RequestValidationError` (sanitized `ctx` stringify), and fallback 500 with logging; `/send/follow-up` now checks `is_suppressed()` 403 + audit log; `/ingest/call` now rejects `..` and absolute paths (traversal) |
 | **Config** | Added `queue_max_items_per_rep`, `trusted_proxies` |
 | **Deps** | `pyproject.toml` adds `passlib[bcrypt]`, `bcrypt` |
@@ -29,10 +29,12 @@
 Run:
 
 ```bash
-pip install -e ".[dev]" && pip install bcrypt passlib
+pip install -e ".[dev,database,redis,monitoring,email]"   # dev already includes bcrypt/passlib via base deps
 pytest tests -q  # ~85s
 pytest tests/simulation -v  # 12s critical scenarios
 ```
+
+> `tests/unit/test_database.py` imports `sqlalchemy` directly, so run unit tests with at least the `dev,database` extras installed.
 
 ## Real-world simulation as test environment
 

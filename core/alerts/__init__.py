@@ -956,6 +956,23 @@ def create_sla_checker() -> SLABreachChecker:
 
     alert_manager.add_channel(console_alert)
 
+    # Wire the Webhook Payload Inspector: every outbound payload sent through
+    # these channels is now captured for the inspector UI/API.
+    # Behind a settings flag, default ON.
+    try:
+        from ..config import get_settings
+        enabled = bool(getattr(get_settings(), "inspector_enabled", True))
+    except Exception:
+        enabled = True
+
+    if enabled:
+        try:
+            from .inspector import wrap_alert_channels
+            wrap_alert_channels(alert_manager)
+            logger.info("Webhook payload inspector wired to alert channels")
+        except Exception as e:
+            logger.warning(f"Failed to wire webhook inspector to alert channels: {e}")
+
     return SLABreachChecker(check_interval=check_interval, alert_manager=alert_manager)
 
 

@@ -84,29 +84,91 @@ def parse_tracking_url(url: str) -> Dict[str, str]:
     return dict(urllib.parse.parse_qsl(parsed.query))
 
 
+def _persist_tracking_event(prospect_id: str, event: str, details: Dict[str, Any]) -> None:
+    """
+    Best-effort persistence of a tracking event.
+
+    Two sinks, both optional:
+      1. The audit trail (core.database.audit) — always attempted.
+      2. FollowUpDraftRecord counters (opens/clicks) — only when a draft
+         record with a matching conversation_id exists.
+
+    Never raises: tracking must not break the request that triggered it.
+    """
+    # 1) Audit trail
+    try:
+        from ..database.audit import audit
+
+        audit.log(
+            action=f"tracking:{event}",
+            entity_type="prospect",
+            entity_id=prospect_id,
+            details=details,
+            actor="tracking",
+        )
+    except Exception:
+        pass  # audit may be unavailable (e.g. no sqlalchemy) — never raise
+
+    # 2) FollowUpDraftRecord counters (best effort, only if a record exists)
+    try:
+        from ..database import get_db
+        from ..database.models import FollowUpDraftRecord
+
+        with get_db() as db:
+            record = (
+                db.query(FollowUpDraftRecord)
+                .filter(FollowUpDraftRecord.conversation_id == prospect_id)
+                .first()
+            )
+            if record is not None:
+                if event == "open":
+                    record.opens = (record.opens or 0) + 1
+                elif event == "click":
+                    record.clicks = (record.clicks or 0) + 1
+    except Exception:
+        pass  # record may not exist or DB may be unavailable — never raise
+
+
 def log_open_event(prospect_id: str, email_address: str) -> Dict[str, Any]:
     """Log an email open event and return tracking data."""
     import hashlib
     email_hash = hashlib.md5(email_address.encode()).hexdigest()[:12]
-    return {
+    result = {
         'prospect_id': prospect_id,
         'email_hash': email_hash,
         'event': 'open',
         'timestamp': datetime.utcnow().isoformat(),
     }
+    # Persist (audit trail + draft-record counters) without changing the
+    # in-memory return-value contract.
+    _persist_tracking_event(prospect_id, 'open', {
+        'email_hash': email_hash,
+        'timestamp': result['timestamp'],
+        'last_opened': result['timestamp'],
+    })
+    return result
 
 
 def log_click_event(prospect_id: str, email_address: str, link_url: str) -> Dict[str, Any]:
     """Log a click event and return tracking data."""
     import hashlib
     email_hash = hashlib.md5(email_address.encode()).hexdigest()[12:24]
-    return {
+    result = {
         'prospect_id': prospect_id,
         'email_hash': email_hash,
         'event': 'click',
         'link_url': link_url,
         'timestamp': datetime.utcnow().isoformat(),
     }
+    # Persist (audit trail + draft-record counters) without changing the
+    # in-memory return-value contract.
+    _persist_tracking_event(prospect_id, 'click', {
+        'email_hash': email_hash,
+        'link_url': link_url,
+        'timestamp': result['timestamp'],
+        'last_clicked': result['timestamp'],
+    })
+    return result
 
 
 def update_prospect_response_status(

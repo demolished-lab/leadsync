@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,14 +47,20 @@ _SALT_PREFIX = "sfa:"
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
     """
-    Hash a password with bcrypt (preferred) fallback to SHA-256+salt for legacy.
+    Hash a password with bcrypt (preferred); falls back to SHA-256+salt only
+    when bcrypt is unavailable (a loud warning is logged — install passlib).
     Returns bcrypt hash or "salt:sha256" for legacy.
     """
     try:
         import bcrypt
         # bcrypt handles its own salt; ignore provided salt for bcrypt path
         return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"bcrypt unavailable ({e}) — falling back to SHA-256+salt password "
+            "hashing, which is NOT recommended in production. "
+            "Install with: pip install \"passlib[bcrypt]\""
+        )
         if salt is None:
             salt = secrets.token_hex(16)
         hashed = hashlib.sha256(f"{_SALT_PREFIX}{salt}:{password}".encode()).hexdigest()
@@ -94,9 +101,12 @@ def _load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if not os.path.exists(path):
         default_password = os.environ.get("ADMIN_PASSWORD")
         if not default_password:
-            # Generate a random password and force change on first login; never default to admin123 in prod
+            # Generate a random password; do NOT default to admin123 in prod.
             default_password = secrets.token_urlsafe(16)
-            logger.warning(f"Generated random admin password for {path} — set ADMIN_PASSWORD env var for deterministic bootstrap")
+            logger.warning(
+                f"No ADMIN_PASSWORD set — generated a random admin password for {path}. "
+                "Set ADMIN_PASSWORD env var for deterministic bootstrap."
+            )
         default_config = {
             "users": {
                 "admin": {
@@ -114,9 +124,26 @@ def _load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         save_config(default_config, path)
         if os.environ.get("ADMIN_PASSWORD"):
             logger.warning(f"Created default auth config at {path} — change the admin password!")
-        # Print one-time to server logs only if auto-generated
-        if not os.environ.get("ADMIN_PASSWORD"):
-            logger.warning(f"Admin bootstrap password (one-time): {default_password}")
+        else:
+            # One-time bootstrap password goes to a protected file next to the
+            # config, NOT into (potentially aggregated/shipped) server logs.
+            secret_file = path.rsplit(".", 1)[0] + "_bootstrap_password.txt"
+            try:
+                with open(secret_file, "w", encoding="utf-8") as sf:
+                    sf.write(default_password + "\n")
+                try:
+                    os.chmod(secret_file, 0o600)
+                except Exception:
+                    pass
+            except Exception:
+                secret_file = None
+            if secret_file:
+                logger.warning(
+                    f"Admin bootstrap password (one-time) written to {secret_file} "
+                    "(mode 0600) — delete it after first login."
+                )
+            else:
+                logger.warning("Admin bootstrap password generated but could not be written to disk")
 
     try:
         import yaml
@@ -520,27 +547,34 @@ class Authenticator:
         return self._config
 
     def authenticate(self, username: str, password: str) -> Tuple[bool, str, Optional[Dict]]:
+        """Authenticate a user (back-compatible 3-tuple form)."""
+        ok, message, user, _token = self.authenticate_token(username, password)
+        return ok, message, user
+
+    def authenticate_token(
+        self, username: str, password: str
+    ) -> Tuple[bool, str, Optional[Dict], Optional[str]]:
         """
-        Authenticate a user.
+        Authenticate a user and return the freshly created session token.
 
         Returns:
-            (success, message, user_data_or_None)
+            (success, message, user_data_or_None, session_token_or_None)
         """
         # Check lockout
         if self._is_locked_out(username):
             config = self.config
             lockout_min = config.get("lockout_minutes", 15)
-            return False, f"Account locked. Try again in {lockout_min} minutes.", None
+            return False, f"Account locked. Try again in {lockout_min} minutes.", None, None
 
         user = get_user(username, self._config_path)
         if user is None:
             self._record_failed_attempt(username)
-            return False, "Invalid username or password.", None
+            return False, "Invalid username or password.", None, None
 
         if not verify_password(password, user["password"]):
             self._record_failed_attempt(username)
             remaining = self.config.get("max_login_attempts", 5) - len(self._failed_attempts.get(username, []))
-            return False, f"Invalid username or password. {remaining} attempts remaining.", None
+            return False, f"Invalid username or password. {remaining} attempts remaining.", None, None
 
         # Success — clear failed attempts
         self._failed_attempts.pop(username, None)
@@ -556,7 +590,7 @@ class Authenticator:
             "team": user.get("team", ""),
         }
 
-        return True, "Login successful.", user_data
+        return True, "Login successful.", user_data, token
 
     def verify_session(self, token: str) -> Optional[Dict[str, Any]]:
         """Verify a session token. Returns user data or None if invalid/expired."""
@@ -725,3 +759,46 @@ def get_api_key_manager() -> APIKeyManager:
     if _api_key_manager is None:
         _api_key_manager = APIKeyManager()
     return _api_key_manager
+
+
+def _cli() -> None:
+    """CLI: python -m core.auth create-user|create-key|list-users|list-keys"""
+    import argparse
+    parser = argparse.ArgumentParser(description="LeadSync authentication management")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_user = sub.add_parser("create-user", help="Create a user")
+    p_user.add_argument("username")
+    p_user.add_argument("password")
+    p_user.add_argument("--name", default="")
+    p_user.add_argument("--email", default="")
+    p_user.add_argument("--role", default="rep", choices=["admin", "rep", "viewer"])
+    p_user.add_argument("--team", default="")
+
+    p_key = sub.add_parser("create-key", help="Create an API key (prints it once)")
+    p_key.add_argument("name")
+    p_key.add_argument("--role", default="rep", choices=["admin", "rep", "viewer"])
+
+    sub.add_parser("list-users", help="List users (no secrets)")
+    sub.add_parser("list-keys", help="List API keys (no secrets)")
+
+    args = parser.parse_args()
+
+    if args.command == "create-user":
+        ok = create_user(args.username, args.password, args.name, args.email, args.role, args.team)
+        sys.exit(0 if ok else 1)
+    elif args.command == "create-key":
+        key = get_api_key_manager().create_key(args.name, args.role)
+        print(f"API key created for '{args.name}' (role={args.role}).")
+        print(f"KEY (shown once, store it safely): {key}")
+    elif args.command == "list-users":
+        for u in list_users():
+            print(u)
+    elif args.command == "list-keys":
+        config = _load_config()
+        for kid, data in config.get("api_keys", {}).items():
+            print({"key_id": kid, **{k: data.get(k) for k in ("name", "role", "created_at")}})
+
+
+if __name__ == "__main__":
+    _cli()
