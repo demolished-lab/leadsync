@@ -71,11 +71,12 @@ docker-compose.override.yml
 # Node (for tooling)
 node_modules/
 
-# Models (large files)
-models/
+# Model weights & ML artifacts (large files)
+# NOTE: this must NOT match core/models/ (pydantic domain models)
 *.bin
 *.gguf
 *.onnx
+whisper_models/
 
 # Audit logs
 *.jsonl
